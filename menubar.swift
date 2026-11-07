@@ -56,6 +56,29 @@ func openInTerminal(_ cmd: String) {
     NSWorkspace.shared.open(URL(fileURLWithPath: path))
 }
 
+func requestAccessibility() {
+    let opts = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
+    if !AXIsProcessTrustedWithOptions(opts) {
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+    }
+}
+
+func postKey(_ code: CGKeyCode, command: Bool = false) {
+    let src = CGEventSource(stateID: .hidSystemState)
+    let down = CGEvent(keyboardEventSource: src, virtualKey: code, keyDown: true)
+    let up = CGEvent(keyboardEventSource: src, virtualKey: code, keyDown: false)
+    if command { down?.flags = .maskCommand; up?.flags = .maskCommand }
+    down?.post(tap: .cghidEventTap)
+    up?.post(tap: .cghidEventTap)
+}
+
+/// 距离你上一次碰键盘/鼠标过去了几秒
+func userIdleSeconds() -> Double {
+    CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: CGEventType(rawValue: UInt32.max)!)
+}
+
+let claudeBundleID = "com.anthropic.claudefordesktop"
+
 // MARK: - 数据模型
 
 struct Acct: Identifiable, Equatable {
@@ -99,7 +122,16 @@ final class Model: ObservableObject {
     @Published var refreshing = false
     @Published var showSettings = false
     @Published var confirmFor: String? = nil
+    @Published var autoResume = true
+    @Published var axTrusted = AXIsProcessTrusted()
+    @Published var interrupted: [String] = []
+    @Published var waitUntil: Double? = nil
+    @Published var waitCount = 0
+    @Published var resuming: String? = nil
     var onSwitchError: ((String) -> Void)?
+
+    /// 当前号快用完、正在等刷新、或有被打断的任务：查得勤一点
+    var hot: Bool { (current?.util ?? 0) >= 85 || waitUntil != nil || !interrupted.isEmpty }
 
     func display(_ n: String?) -> String {
         guard let n = n else { return "?" }
@@ -153,6 +185,12 @@ final class Model: ObservableObject {
         let sw = j["switching"] as? [String: Any]
         switchingTo = sw?["to"] as? String
         switchPhase = sw?["phase"] as? String ?? ""
+        interrupted = (j["interrupted"] as? [[String: Any]] ?? []).map { $0["title"] as? String ?? "" }
+        let rw = j["resume_wait"] as? [String: Any]
+        waitUntil = rw == nil ? nil : (rw?["until"] as? Double ?? 0)
+        waitCount = rw?["count"] as? Int ?? 0
+        resuming = (j["resume_active"] as? [[String: Any]])?.first.map { $0["title"] as? String ?? "" }
+        axTrusted = AXIsProcessTrusted()
         if let s = j["settings"] as? [String: Any] {
             mode = s["auto_switch"] as? String ?? "notify"
             threshold = s["switch_threshold"] as? Double ?? 95
@@ -160,6 +198,7 @@ final class Model: ObservableObject {
             confirm = s["confirm_switch"] as? Bool ?? true
             loginItem = s["login_item"] as? Bool ?? true
             pinOrg = s["pin_org"] as? Bool ?? true
+            autoResume = s["auto_resume"] as? Bool ?? true
             pinReady = s["pin_org_ready"] as? Bool ?? true
             if let o = (s["org_names"] as? [String])?.first { orgName = o.components(separatedBy: " - ").first ?? o }
             if let w = s["work_hours"] as? [String: Any] {
@@ -280,7 +319,7 @@ struct AccountCard: View {
             Button("重新登录") { openInTerminal("cduo login \(a.name)") }
                 .buttonStyle(.bordered).controlSize(.small)
         } else if a.current {
-            Text(m.mode == "idle" ? "用满后自动切走" : "正在使用")
+            Text(m.mode == "idle" ? "用完自动换走" : "正在使用")
                 .font(.system(size: 11)).foregroundColor(.secondary).frame(height: 22)
         } else if m.switchingTo != nil {
             ProgressView().controlSize(.small).frame(height: 22)
@@ -354,7 +393,7 @@ struct IconButton: View {
 
 struct MainView: View {
     @ObservedObject var m: Model
-    var modeName: String { ["off": "手动", "notify": "提醒我", "idle": "自动切换"][m.mode] ?? "提醒我" }
+    var modeName: String { ["off": "手动", "notify": "提醒我", "idle": "全自动"][m.mode] ?? "提醒我" }
 
     var body: some View {
         VStack(spacing: 14) {
@@ -391,6 +430,17 @@ struct MainView: View {
             Banner(icon: "arrow.triangle.2.circlepath",
                    text: m.switchPhase == "waiting" ? "等 Claude 这一轮回复结束，就切到 \(m.display(to))" : "正在重启 Claude，切到 \(m.display(to))…",
                    color: .accentColor)
+        } else if let t = m.resuming {
+            Banner(icon: "play.circle.fill", text: "正在续上被额度打断的任务「\(t.isEmpty ? "会话" : t)」…", color: .accentColor)
+        } else if let w = m.waitUntil {
+            Banner(icon: "hourglass",
+                   text: "两个号都用完了。" + (w > 0 ? "\(hhmm(w)) 有号刷新后自动换过去" : "等额度刷新后自动换过去")
+                       + (m.waitCount > 0 && m.autoResume ? "，并续上 \(m.waitCount) 个被打断的任务" : ""),
+                   color: .red)
+        } else if !m.interrupted.isEmpty && m.mode != "idle" && m.recAction == "switch" {
+            Banner(icon: "exclamationmark.circle.fill",
+                   text: "任务「\(m.interrupted[0])」被额度打断了。切到 \(m.display(m.recTarget)) 后" + (m.autoResume ? "会自动续上" : "发一句「继续」即可"),
+                   color: .orange)
         } else if m.recAction == "switch" {
             Banner(icon: "lightbulb.fill", text: "建议切到 \(m.display(m.recTarget))：\(m.recReason)", color: .orange)
         } else if m.recAction == "wait" {
@@ -461,16 +511,30 @@ struct SettingsView: View {
                 VStack(spacing: 16) {
                     group("切换") {
                         Picker("", selection: binding({ m.mode }, { m.mode = $0; m.set("auto_switch", $0) })) {
-                            Text("手动").tag("off"); Text("提醒我").tag("notify"); Text("自动").tag("idle")
+                            Text("手动").tag("off"); Text("提醒我").tag("notify"); Text("全自动").tag("idle")
                         }.pickerStyle(.segmented).labelsHidden().frame(maxWidth: .infinity)
                         Text(["off": "只显示额度，不打扰你。",
                               "notify": "该换号时发通知，点通知上的「切换」即可。",
-                              "idle": "当前号用满、Claude 空闲 3 分钟后自动切换。"][m.mode] ?? "")
+                              "idle": "用完才换号，一点不浪费。两个号都用完时，等先刷新的那个。"][m.mode] ?? "")
                             .font(.system(size: 11)).foregroundColor(.secondary).frame(maxWidth: .infinity, alignment: .leading)
-                        row("用到多少算「快用完」") {
-                            Picker("", selection: binding({ Int(m.threshold) }, { m.threshold = Double($0); m.set("switch_threshold", "\($0)") })) {
-                                Text("80%").tag(80); Text("90%").tag(90); Text("95%").tag(95)
-                            }.pickerStyle(.segmented).labelsHidden().frame(width: 150)
+                        if m.mode != "idle" {
+                            row("用到多少算「快用完」") {
+                                Picker("", selection: binding({ Int(m.threshold) }, { m.threshold = Double($0); m.set("switch_threshold", "\($0)") })) {
+                                    Text("80%").tag(80); Text("90%").tag(90); Text("95%").tag(95)
+                                }.pickerStyle(.segmented).labelsHidden().frame(width: 150)
+                            }
+                        }
+                        row("自动续上被打断的任务", note: "只在额度用完、任务被迫中断时，换号后替你发一句「继续」") {
+                            toggle({ m.autoResume }, { m.autoResume = $0; m.set("auto_resume", $0 ? "on" : "off") })
+                        }
+                        if m.autoResume && !m.axTrusted {
+                            HStack(spacing: 8) {
+                                Image(systemName: "hand.raised.fill").foregroundColor(.orange).font(.system(size: 12))
+                                Text("需要「辅助功能」权限才能替你按发送").font(.system(size: 11)).foregroundColor(.secondary)
+                                Spacer(minLength: 4)
+                                Button("去授权") { requestAccessibility(); DispatchQueue.main.asyncAfter(deadline: .now() + 2) { m.axTrusted = AXIsProcessTrusted() } }
+                                    .buttonStyle(.bordered).controlSize(.small)
+                            }
                         }
                         row("切换前先确认") { toggle({ m.confirm }, { m.confirm = $0; m.set("confirm_switch", $0 ? "on" : "off") }) }
                     }
@@ -650,6 +714,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     var timer: Timer?, queueTimer: Timer?
     var notifAuthorized = false
     var bag: Any?
+    var resumeBusy = false
+    var askedAX = false
+    var ticks = 0
 
     func applicationDidFinishLaunching(_ n: Notification) {
         if dumpMode { dumpPreviews(); return }
@@ -667,9 +734,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         heartbeat()
         model.refresh(network: true)
         timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
-            self?.heartbeat(); self?.model.refresh(network: false)
+            guard let self = self else { return }
+            self.heartbeat(); self.ticks += 1
+            // 快用完 / 等刷新 / 有任务被打断时每分钟真查一次额度，平时交给后台每 5 分钟
+            let due = self.model.waitUntil.map { $0 > 0 && $0 <= Date().timeIntervalSince1970 } ?? false
+            if (self.model.hot && self.ticks % 2 == 0) || due {
+                runCduo(["tick"]) { [weak self] _, _ in self?.model.refresh(network: false) }
+            } else {
+                self.model.refresh(network: false)
+            }
         }
-        queueTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in self?.drainQueue() }
+        queueTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+            self?.drainQueue(); self?.checkResume()
+        }
     }
 
     @objc func togglePopover() {
@@ -704,7 +781,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         c.delegate = self
         let sw = UNNotificationAction(identifier: "SWITCH", title: "切换", options: [])
         let later = UNNotificationAction(identifier: "LATER", title: "稍后", options: [])
-        c.setNotificationCategories([UNNotificationCategory(identifier: "SUGGEST", actions: [sw, later], intentIdentifiers: [], options: [])])
+        let open = UNNotificationAction(identifier: "OPEN", title: "打开会话", options: [.foreground])
+        c.setNotificationCategories([UNNotificationCategory(identifier: "SUGGEST", actions: [sw, later], intentIdentifiers: [], options: []),
+                                     UNNotificationCategory(identifier: "RESUME", actions: [open], intentIdentifiers: [], options: [])])
         c.requestAuthorization(options: [.alert, .sound]) { ok, _ in DispatchQueue.main.async { self.notifAuthorized = ok } }
     }
 
@@ -722,6 +801,83 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             post(title: j["title"] as? String ?? "Cduo", body: j["msg"] as? String ?? "", kind: j["kind"] as? String ?? "info", target: j["target"] as? String)
         }
         model.refresh(network: false)
+    }
+
+    // MARK: 续上被额度打断的任务
+
+    /// 队列文件里有到点的任务才去调 cduo（避免每 3 秒起一次 Python）
+    func checkResume() {
+        guard !resumeBusy else { return }
+        let path = cduoDir + "/resume-queue.json"
+        guard let d = FileManager.default.contents(atPath: path),
+              let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+              let items = j["items"] as? [[String: Any]] else { return }
+        let nowT = Date().timeIntervalSince1970
+        guard items.contains(where: { ($0["state"] as? String) == "pending" && ($0["not_before"] as? Double ?? 0) <= nowT }) else { return }
+        guard NSRunningApplication.runningApplications(withBundleIdentifier: claudeBundleID).first?.isFinishedLaunching == true else { return }
+        resumeBusy = true
+        runCduo(["resume", "next"]) { [weak self] out, _ in
+            guard let self = self else { return }
+            guard let line = out.split(separator: "\n").last(where: { $0.hasPrefix("{") }),
+                  let data = line.data(using: .utf8),
+                  let it = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let sid = it["session"] as? String, let msg = it["message"] as? String else { self.resumeBusy = false; return }
+            self.model.refresh(network: false)
+            self.performResume(session: sid, message: msg, title: it["title"] as? String ?? "")
+        }
+    }
+
+    func performResume(session sid: String, message: String, title: String) {
+        let finish: (String) -> Void = { [weak self] act in
+            runCduo(["resume", act, sid]) { out, _ in
+                let r = (out.split(separator: "\n").last(where: { $0.hasPrefix("{") }).flatMap { $0.data(using: .utf8) })
+                    .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
+                if (r["ok"] as? Bool) != true && (r["final"] as? Bool ?? true) {
+                    self?.postResumeFallback(session: sid, message: message, title: title)
+                }
+                self?.resumeBusy = false
+                self?.model.refresh(network: false)
+            }
+        }
+        guard AXIsProcessTrusted() else {
+            if !askedAX { askedAX = true; requestAccessibility() }   // 第一次需要时请你授权一次
+            finish("manual"); return
+        }
+        guard userIdleSeconds() >= 5 else { finish("defer"); return }   // 你正在用电脑，晚点再试
+        NSWorkspace.shared.open(URL(string: "claude://code/continue?session=\(sid)")!)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+            if NSWorkspace.shared.frontmostApplication?.bundleIdentifier != claudeBundleID {
+                NSRunningApplication.runningApplications(withBundleIdentifier: claudeBundleID).first?.activate()
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == claudeBundleID,
+                      userIdleSeconds() >= 3 else { finish("defer"); return }
+                let pb = NSPasteboard.general
+                let old = pb.string(forType: .string)
+                pb.clearContents(); pb.setString(message, forType: .string)
+                postKey(9, command: true)                     // ⌘V
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    postKey(36)                               // 回车发送
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                        pb.clearContents(); if let o = old { pb.setString(o, forType: .string) }
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 6) { finish("check") }
+                }
+            }
+        }
+    }
+
+    func postResumeFallback(session sid: String, message: String, title: String) {
+        let c = UNMutableNotificationContent()
+        c.title = "续上被额度打断的任务"
+        c.body = "点这里打开「\(title.isEmpty ? "会话" : title)」，续上的话已经复制好，粘贴发送即可。"
+        c.categoryIdentifier = "RESUME"
+        c.userInfo = ["session": sid, "message": message]
+        if notifAuthorized {
+            UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil))
+        } else {
+            post(title: c.title, body: "打开「\(title)」发一句「继续」即可", kind: "info", target: nil)
+        }
     }
 
     func post(title: String, body: String, kind: String, target: String?) {
@@ -744,7 +900,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
                                 withCompletionHandler completionHandler: @escaping () -> Void) {
-        if let t = response.notification.request.content.userInfo["target"] as? String,
+        let info = response.notification.request.content.userInfo
+        if let sid = info["session"] as? String, response.actionIdentifier != UNNotificationDismissActionIdentifier {
+            DispatchQueue.main.async {
+                if let msg = info["message"] as? String {
+                    NSPasteboard.general.clearContents(); NSPasteboard.general.setString(msg, forType: .string)
+                }
+                NSWorkspace.shared.open(URL(string: "claude://code/continue?session=\(sid)")!)
+            }
+        } else if let t = info["target"] as? String,
            response.actionIdentifier == "SWITCH" || response.actionIdentifier == UNNotificationDefaultActionIdentifier {
             DispatchQueue.main.async { self.model.startSwitch(t) }
         }
@@ -765,6 +929,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
                 sw.recAction = "switch"; sw.recTarget = sw.accts.first(where: { !$0.current })?.name; sw.recReason = "当前号已用 96%"
                 if let i = sw.accts.firstIndex(where: { $0.current }) { sw.accts[i].util = 96; sw.accts[i].running = true }
                 renderPNG(MainView(m: sw), "\(dir)/suggest-\(s).png", dark: dark)
+                let wt = Model(); wt.apply(runCduoSync(["status", "--json", "--cached"]).0)
+                wt.mode = "idle"; wt.recAction = "wait"; wt.waitUntil = Date().timeIntervalSince1970 + 3000; wt.waitCount = 1
+                for i in wt.accts.indices { wt.accts[i].util = 100; wt.accts[i].running = true }
+                renderPNG(MainView(m: wt), "\(dir)/wait-\(s).png", dark: dark)
             }
             print("previews written")
         }

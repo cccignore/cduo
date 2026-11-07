@@ -29,11 +29,12 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 HOME = pathlib.Path.home()
 CDUO = pathlib.Path(os.environ.get("CDUO_HOME", str(HOME / ".cduo")))
 CONFIG = CDUO / "config.json"
 STATE = CDUO / "state.json"
+RESUME_Q = CDUO / "resume-queue.json"
 LOGDIR = CDUO / "logs"
 BACKUP = CDUO / "backup"
 PROFILES = CDUO / "desktop"
@@ -62,11 +63,12 @@ DEFAULT_CONFIG = {
     "confirm_switch": True,          # 菜单栏切换前是否弹确认
     "work_hours": None,              # {"start":"10:00","end":"01:00"}，只用于显示；active_hours 由它推出
     "pin_org": True,                 # 换号时强制进入该账号的主组织（如 Premium Seat）
+    "auto_resume": True,             # 任务被额度打断后，换号（或额度刷新）时自动发一句"继续"
     "projects_dirs": [str(HOME / ".claude/projects")],
     "accounts": [],
 }
 
-MODE_TEXT = {"off": "手动", "notify": "提醒我", "idle": "自动（用满且空闲时）"}
+MODE_TEXT = {"off": "手动", "notify": "提醒我", "idle": "全自动（用完自动换号，被打断的任务自动续上）"}
 
 TTY = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
 C = {k: (v if TTY else "") for k, v in {
@@ -948,7 +950,7 @@ def plan_pings(cfg: dict, st: dict):
 
 def recommend(cfg: dict, st: dict) -> dict:
     """用'最早过期优先'（EDF）决定桌面版该用哪个号，带防抖。"""
-    thr = float(cfg.get("switch_threshold", 95))
+    thr = 99.5 if cfg.get("auto_switch") == "idle" else float(cfg.get("switch_threshold", 95))
     cur = st.get("desktop_current")
     cands = [a for a in cfg["accounts"] if has_profile(a["name"])]
     if not cands:
@@ -1031,29 +1033,303 @@ def tick(cfg: dict, verbose: bool = False, allow_ping: bool = True) -> dict:
                            "name": acct["name"] if acct else (idle_next[0] if idle_next else None)}
         rec = recommend(cfg, st)
         st["recommend"] = rec
-        key = f"{rec.get('action')}:{rec.get('target')}"
         mode = cfg.get("auto_switch", "notify")
-        auto_now = rec.get("action") == "switch" and rec.get("urgent") and mode == "idle"
-        if rec.get("action") == "switch" and st.get("last_notified") != key and mode != "off" and not auto_now:
-            notify(rec["reason"], f"建议切换到 {lbl(cfg, rec['target'])}", kind="suggest", target=rec["target"])
+        cur = st.get("desktop_current")
+        inter = interrupted_now(cfg, st) if cur else []
+        st["interrupted"] = [{"session": i["session"], "title": i["title"]} for i in inter]
+        cur_u = effective_util(st["accounts"].get(cur, {})) if cur else None
+        exhausted = bool(inter) or (cur_u is not None and cur_u >= 99.5)
+        app_up = bool(desktop_pids())
+        plan = None   # ("switch", 目标, 要续上的任务) / ("resume", None, 任务)
+        if mode == "idle" and exhausted:
+            if inter and cur_u is not None and cur_u < 90:      # 等的时候本号已经刷新
+                plan = ("resume", None, inter)
+            else:
+                tgt = pick_target(cfg, st, exclude=cur)
+                if tgt:
+                    plan = ("switch", tgt, inter)
+                    rec = {"action": "switch", "target": tgt, "urgent": True,
+                           "reason": f"{lbl(cfg, cur)} 额度用完了" + ("，换号后自动续上被打断的任务" if inter else "")}
+                    st["recommend"] = rec
+                else:
+                    soon = min((u.get("resets_at") for u in st["accounts"].values() if window_running(u)), default=None)
+                    st["resume_wait"] = {"until": soon, "count": len(inter)}
+                    if st.get("last_notified") != f"wait:{soon}":
+                        notify((f"{hhmm(soon)} 有号刷新后，会自动换过去" + ("并续上被打断的任务" if inter else ""))
+                               if soon else "等额度刷新后再继续", "两个号都用完了")
+                        st["last_notified"] = f"wait:{soon}"
+        if not (mode == "idle" and exhausted and not plan):
+            st.pop("resume_wait", None)
+        if mode == "idle" and not plan and rec.get("action") == "switch" and not rec.get("urgent") \
+                and app_up and now() - last_transcript_write(cfg) > 3600:
+            plan = ("switch", rec["target"], [])   # 离开超过 1 小时：缓存反正过期了，换号不多花
+        key = f"{rec.get('action')}:{rec.get('target')}"
+        if mode != "idle" and rec.get("action") == "switch" and st.get("last_notified") != key and mode != "off":
+            title = f"建议切换到 {lbl(cfg, rec['target'])}"
+            msg = rec["reason"]
+            if inter:
+                title, msg = "任务被额度打断了", f"点「切换」换到 {lbl(cfg, rec['target'])}，并自动续上被打断的任务"
+            notify(msg, title, kind="suggest", target=rec["target"])
             st["last_notified"] = key
-        elif rec.get("action") != "switch":
+        elif rec.get("action") != "switch" and not str(st.get("last_notified") or "").startswith("wait:"):
             st["last_notified"] = None
         save_state(st)
         if pinged:
             log(f"tick: pinged {pinged}")
-    if auto_now:
-        running = bool(desktop_pids())
-        idle_for = now() - last_transcript_write(cfg)
-        if not running or idle_for > 180:   # App 没开就直接换好，下次打开即是新号
-            log(f"auto-switch to {rec['target']} ({rec['reason']}, app {'running' if running else 'closed'})")
-            try:
-                do_switch(cfg, rec["target"], after_turn=running, relaunch=running)
-            except SystemExit:
-                pass
-            except Exception as e:
-                log(f"auto-switch failed: {e}")
+    if plan and plan[0] == "resume":
+        if cfg.get("auto_resume", True) and app_up:
+            queue_resume(plan[2], "reset", delay=2)
+    elif plan:
+        log(f"auto-switch to {plan[1]} ({rec.get('reason')}, app {'running' if app_up else 'closed'})")
+        try:
+            do_switch(cfg, plan[1], after_turn=app_up, relaunch=app_up, resume=app_up)
+        except SystemExit:
+            pass
+        except Exception as e:
+            log(f"auto-switch failed: {e}")
     return load_state()
+
+
+# ───────────────────────── 被额度打断的任务：检测 + 续上 ─────────────────────────
+
+LIMIT_RE = re.compile(r"session limit|usage limit|5-hour limit|hit your limit|limit reached", re.I)
+RESUME_MARK = "（Cduo）"
+RESUME_TEXT = {
+    "switch": RESUME_MARK + "上一轮因为额度用完被中断了，现在已换到另一个账号。请先确认刚才做到哪一步，再从中断的地方继续。",
+    "reset": RESUME_MARK + "上一轮因为额度用完被中断了，现在额度已刷新。请先确认刚才做到哪一步，再从中断的地方继续。",
+    "test": RESUME_MARK + "测试：这是 Cduo「自动续上」功能的测试消息，不用做任何事，回复「收到」即可。",
+}
+
+
+def _all_pointers() -> list:
+    """所有 账号/组织 文件夹里的会话记录，按 sessionId 去重（取最新）。"""
+    best = {}
+    if not SESSIONS_ROOT.is_dir():
+        return []
+    for p in SESSIONS_ROOT.glob("*/*/local_*.json"):
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        sid = d.get("sessionId") or f"local_{_uuid_of(p.name)}"
+        d["sessionId"] = sid
+        if sid not in best or (d.get("lastActivityAt") or 0) > (best[sid].get("lastActivityAt") or 0):
+            best[sid] = d
+    return list(best.values())
+
+
+def transcript_for(cfg: dict, cli_id) -> str | None:
+    if not cli_id or not re.match(r"^[0-9a-f-]{36}$", str(cli_id)):
+        return None
+    found = []
+    for d in cfg.get("projects_dirs") or []:
+        found += glob_paths(os.path.join(os.path.expanduser(d), "*", f"{cli_id}.jsonl"))
+    return max(found, key=os.path.getmtime) if found else None
+
+
+def tail_entries(path: str, max_bytes: int = 400_000) -> list:
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        f.seek(max(0, size - max_bytes))
+        data = f.read()
+    lines = data.split(b"\n")
+    if size > max_bytes:
+        lines = lines[1:]
+    out = []
+    for line in lines:
+        line = line.strip()
+        if line:
+            with contextlib.suppress(Exception):
+                out.append(json.loads(line))
+    return out
+
+
+def is_auto_message(e: dict) -> bool:
+    """不是你打的字：后台任务完成通知、其他会话发来的消息等（origin.kind 不是 human）。"""
+    o = e.get("origin")
+    return e.get("type") == "user" and isinstance(o, dict) and o.get("kind") not in (None, "human")
+
+
+def last_turn_entry(entries: list):
+    """最后一条真正的对话记录（跳过系统记录、子任务、元信息、自动消息）。"""
+    for e in reversed(entries):
+        if e.get("type") in ("user", "assistant") and not e.get("isSidechain") and not e.get("isMeta") \
+                and not is_auto_message(e):
+            return e
+    return None
+
+
+def entry_text(e: dict) -> str:
+    c = (e.get("message") or {}).get("content")
+    if isinstance(c, str):
+        return c
+    return " ".join(x.get("text", "") for x in (c or []) if isinstance(x, dict) and x.get("type") == "text")
+
+
+def is_limit_error(e) -> bool:
+    """Claude Code 撞上 5 小时额度时写入的报错，例如 "You've hit your session limit · resets 2:30pm"。"""
+    if not e or e.get("type") != "assistant" or not e.get("isApiErrorMessage") or e.get("error") != "rate_limit":
+        return False
+    t = entry_text(e)
+    return bool(LIMIT_RE.search(t)) and "spend" not in t.lower()
+
+
+def find_interrupted(cfg: dict, since: float) -> list:
+    """被额度打断、之后没人再动过的会话：最后一条对话记录就是额度报错，且发生在 since 之后。
+
+    你自己停掉的、看到报错后又发过消息的、空闲时没在跑的会话都不算。
+    """
+    res = []
+    for d in _all_pointers():
+        if d.get("isArchived"):
+            continue
+        path = transcript_for(cfg, d.get("cliSessionId"))
+        if not path or os.path.getmtime(path) < since - 5:
+            continue
+        try:
+            e = last_turn_entry(tail_entries(path))
+        except Exception:
+            continue
+        if not is_limit_error(e):
+            continue
+        ts = parse_iso(e.get("timestamp")) or os.path.getmtime(path)
+        if ts < since:
+            continue
+        res.append({"session": d["sessionId"], "cli": d.get("cliSessionId"), "title": d.get("title") or "",
+                    "error_uuid": e.get("uuid") or f"{d['sessionId']}@{ts:.0f}", "at": ts})
+    return res
+
+
+def interrupted_now(cfg: dict, st: dict) -> list:
+    """本账号用着时（上次换号之后）被打断、还没处理过的任务。"""
+    since = max((st.get("last_switch") or {}).get("at", 0), now() - 6 * 3600)
+    handled = st.get("resume_handled") or {}
+    return [i for i in find_interrupted(cfg, since) if i["error_uuid"] not in handled]
+
+
+def load_resume_q() -> dict:
+    try:
+        q = read_json(RESUME_Q, None)
+    except RuntimeError:
+        q = None
+    return q if isinstance(q, dict) and isinstance(q.get("items"), list) else {"items": []}
+
+
+def queue_resume(items: list, kind: str, delay: float = 12) -> int:
+    """交给菜单栏 App：打开会话、粘贴一句"继续"、回车。"""
+    if not items:
+        return 0
+    q = load_resume_q()
+    have = {i.get("error_uuid") for i in q["items"]}
+    added = 0
+    for it in items:
+        if it["error_uuid"] in have:
+            continue
+        q["items"].append(dict(it, kind=kind, message=RESUME_TEXT.get(kind, RESUME_TEXT["switch"]),
+                               state="pending", attempts=0, queued_at=now(), not_before=now() + delay))
+        added += 1
+    q["items"] = [i for i in q["items"] if i.get("state") in ("pending", "typing")
+                  or now() - i.get("queued_at", 0) < 86400][-30:]
+    write_json(RESUME_Q, q)
+    st = load_state()
+    h = st.setdefault("resume_handled", {})
+    for it in items:
+        h[it["error_uuid"]] = now()
+    st["resume_handled"] = {k: v for k, v in h.items() if now() - v < 2 * 86400}
+    save_state(st)
+    if added:
+        log(f"resume queued ({kind}): " + ", ".join(i.get("title") or i["session"] for i in items))
+        if not menubar_alive():
+            notify("Cduo 菜单栏没在运行，无法自动续上。打开原来的会话发一句「继续」即可。", "任务被额度打断")
+    return added
+
+
+def _resume_item(q: dict, sid: str):
+    return next((i for i in q["items"] if i.get("session") == sid and i.get("state") in ("pending", "typing")), None)
+
+
+def cmd_resume(args, cfg):
+    """resume SESSION        手动排一个续上任务（测试用，会话可写 last）
+       resume next           菜单栏取下一个要续上的任务（JSON）
+       resume check SESSION  菜单栏发完后核对：会话里出现了续上的消息才算成功
+       resume defer|manual|fail SESSION"""
+    act, sid = args.action, args.session
+    q = load_resume_q()
+    if act == "next":
+        due = [i for i in q["items"] if i.get("state") == "pending" and i.get("not_before", 0) <= now()]
+        if not due or not desktop_pids():
+            print("{}")
+            return
+        it = due[0]
+        it["state"], it["attempts"], it["started_at"] = "typing", it.get("attempts", 0) + 1, now()
+        write_json(RESUME_Q, q)
+        print(json.dumps(it, ensure_ascii=False))
+        return
+    if act in ("check", "defer", "manual", "fail"):
+        it = _resume_item(q, sid)
+        if not it:
+            print(json.dumps({"ok": False, "final": True}))
+            return
+        ok = False
+        if act == "check":
+            path = transcript_for(cfg, it.get("cli"))
+            if path:
+                t0 = it.get("started_at", 0) - 5
+                for e in tail_entries(path):
+                    ts = parse_iso(e.get("timestamp")) or 0
+                    if e.get("type") == "user" and ts >= t0 and RESUME_MARK in entry_text(e):
+                        ok = True
+                        break
+        final = True
+        if ok:
+            it["state"] = "done"
+            log(f"resumed: {it.get('title') or sid}")
+        elif act == "defer":                    # 你正在用电脑，晚点再试
+            waited = now() - it.get("queued_at", now())
+            if waited < 180:
+                it["state"], it["not_before"], final = "pending", now() + 20, False
+            else:
+                it["state"] = "manual"
+        elif act == "check" and it.get("attempts", 0) < 2:
+            it["state"], it["not_before"], final = "pending", now() + 8, False
+        else:
+            it["state"] = "manual" if act in ("manual", "defer") else "failed"
+            log(f"resume {it['state']}: {it.get('title') or sid}")
+        write_json(RESUME_Q, q)
+        print(json.dumps({"ok": ok, "final": final, "state": it["state"], "message": it.get("message"),
+                          "title": it.get("title")}, ensure_ascii=False))
+        return
+    # 手动排队（测试用）
+    me = os.environ.get("CLAUDE_CODE_HOST_SESSION_ID")
+    ptrs = [x for x in _all_pointers() if not x.get("isArchived")]
+    if sid == "test":   # 最新建的那个会话（不含正在运行这条命令的会话），发一句无害的测试消息
+        ptrs = sorted((x for x in ptrs if x["sessionId"] != me), key=lambda d: d.get("createdAt") or 0, reverse=True)
+        args.kind = "test"
+    else:
+        ptrs.sort(key=lambda d: d.get("lastActivityAt") or 0, reverse=True)
+    d = ptrs[0] if sid in (None, "last", "test") and ptrs else next((x for x in ptrs if x["sessionId"] == sid), None)
+    if not d:
+        die("找不到这个会话（用 local_… 形式的 id，或写 last / test）")
+    item = {"session": d["sessionId"], "cli": d.get("cliSessionId"), "title": d.get("title") or "",
+            "error_uuid": f"manual-{now():.0f}", "at": now()}
+    queue_resume([item], args.kind or "switch", delay=float(args.delay))
+    print(f"✓ 已排队：约 {int(float(args.delay))} 秒后，菜单栏会打开「{item['title'] or d['sessionId']}」并发一句续上的话")
+
+
+def pick_target(cfg: dict, st: dict, exclude=None):
+    """还有余量（<90%）的号里，选最早刷新的那个（EDF）。"""
+    c = []
+    for a in cfg["accounts"]:
+        n = a["name"]
+        if n == exclude or not has_profile(n):
+            continue
+        u = st["accounts"].get(n, {})
+        eu = effective_util(u)
+        if eu is None or eu >= 90:
+            continue
+        c.append((0 if window_running(u) else 1, u.get("resets_at") if window_running(u) else 9e12, n))
+    return min(c)[2] if c else None
 
 
 # ───────────────────────── 切换 ─────────────────────────
@@ -1066,7 +1342,8 @@ def spawn_detached(args: list) -> None:
                      stdout=out, stderr=out, start_new_session=True, env=env, cwd=str(HOME))
 
 
-def do_switch(cfg: dict, target: str, after_turn: bool = False, relaunch: bool = True, force: bool = False) -> None:
+def do_switch(cfg: dict, target: str, after_turn: bool = False, relaunch: bool = True, force: bool = False,
+              resume: bool = True) -> None:
     get_account(cfg, target)
     if not has_profile(target):
         die(f"{target} 还没有桌面版登录快照。先在桌面版登录它，然后运行 cduo capture {target}")
@@ -1089,6 +1366,8 @@ def do_switch(cfg: dict, target: str, after_turn: bool = False, relaunch: bool =
             phase(None)
             notify("Claude 一直在回复，切换已取消，稍后再试", "切换取消")
             die("等了 15 分钟仍在忙，取消切换")
+    # 只有"被额度打断、之后没人动过"的任务才自动续上；正常换号什么都不发
+    to_resume = interrupted_now(cfg, load_state()) if resume and cfg.get("auto_resume", True) else []
     with file_lock("switch"):
         was_running = bool(desktop_pids())
         phase("restarting")
@@ -1118,7 +1397,11 @@ def do_switch(cfg: dict, target: str, after_turn: bool = False, relaunch: bool =
             launch_desktop()
     msg = f"已切换到 {T}"
     log(f"switch {cur} -> {target} {s}")
-    notify("点开原来的会话就能接着聊", msg)
+    if to_resume and relaunch and was_running:
+        queue_resume(to_resume, "switch")
+        notify(f"Claude 打开后会自动续上 {len(to_resume)} 个被额度打断的任务", msg)
+    else:
+        notify("点开原来的会话就能接着聊", msg)
     print(f"{C['g']}✓ {msg}{C['r']}")
 
 
@@ -1133,6 +1416,9 @@ def cmd_status(args, cfg):
         out = {"accounts": [], "recommend": st.get("recommend"), "next_ping": st.get("next_ping"),
                "desktop_current": st.get("desktop_current"), "updated": st.get("updated"),
                "switching": sw, "version": VERSION,
+               "interrupted": st.get("interrupted") or [], "resume_wait": st.get("resume_wait"),
+               "resume_active": [{"title": i.get("title"), "state": i.get("state")} for i in load_resume_q()["items"]
+                                 if i.get("state") in ("pending", "typing")],
                "settings": {"auto_switch": cfg.get("auto_switch", "notify"),
                             "switch_threshold": cfg.get("switch_threshold", 95),
                             "prewarm_enabled": cfg.get("prewarm_enabled", True),
@@ -1140,6 +1426,7 @@ def cmd_status(args, cfg):
                             "work_hours": cfg.get("work_hours"),
                             "login_item": login_item_enabled(),
                             "pin_org": cfg.get("pin_org", True),
+                            "auto_resume": cfg.get("auto_resume", True),
                             "pin_org_ready": all(a.get("org_uuid") in (read_json(ORG_COOKIES, {}) or {})
                                                  for a in cfg["accounts"] if a.get("org_uuid")),
                             "org_names": sorted({a.get("org_name") for a in cfg["accounts"] if a.get("org_name")}),
@@ -1354,7 +1641,7 @@ def cmd_config(args, cfg):
         if val not in ("off", "notify", "idle"):
             die("auto_switch 只能是 off / notify / idle")
         cfg[key] = val
-    elif key in ("prewarm_enabled", "confirm_switch", "pin_org"):
+    elif key in ("prewarm_enabled", "confirm_switch", "pin_org", "auto_resume"):
         cfg[key] = onoff(val)
     elif key in ("proxy", "claude_bin"):
         cfg[key] = val
@@ -1635,7 +1922,14 @@ def main():
     p.add_argument("action", choices=["install", "uninstall", "status", "login-on", "login-off"])
     p.add_argument("--no-menubar", action="store_true")
     sub.add_parser("doctor", help="自检")
+    p = sub.add_parser("resume", help="续上被额度打断的任务：resume last（测试）/ next / check ID")
+    p.add_argument("action", nargs="?", default="queue")
+    p.add_argument("session", nargs="?")
+    p.add_argument("--kind", choices=["switch", "reset", "test"])
+    p.add_argument("--delay", default="5")
     args = ap.parse_args()
+    if args.cmd == "resume" and args.action not in ("next", "check", "defer", "manual", "fail", "queue"):
+        args.session, args.action = args.action, "queue"
     cfg = load_config()
     if not cfg.get("claude_bin") or not pathlib.Path(cfg["claude_bin"]).exists():
         cfg["claude_bin"] = find_claude_bin()
@@ -1644,7 +1938,7 @@ def main():
     cmds = {"status": cmd_status, "switch": cmd_switch, "setup": cmd_setup, "add": cmd_add, "login": cmd_login,
             "capture": cmd_capture, "desktop-login": cmd_desktop_login, "ping": cmd_ping, "sync": cmd_sync,
             "tick": cmd_tick, "config": cmd_config, "agents": cmd_agents, "doctor": cmd_doctor,
-            "rename": cmd_rename, "pin-org": cmd_pin_org}
+            "rename": cmd_rename, "pin-org": cmd_pin_org, "resume": cmd_resume}
     if not args.cmd:
         args = ap.parse_args(["status"])
     try:
