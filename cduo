@@ -1,0 +1,1658 @@
+#!/usr/bin/env python3
+"""cduo — 两个 Claude 账号：桌面版一键切换（对话不丢）+ 5h 窗口错峰预热。
+
+只用 Python 3.9 标准库。数据都在 ~/.cduo/ 下：
+  config.json   账号与偏好
+  state.json    最近一次额度/调度状态（菜单栏读它）
+  desktop/<名>/ 桌面版登录快照（config.json 里的 3 个 oauth 字段 + Cookies）
+  cli/<名>/     每个账号专用的 Claude Code CLI 配置目录（查额度、发预热）
+  backup/       每次切换前的备份
+  logs/         日志
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import os
+import pathlib
+import plistlib
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+VERSION = "0.3.0"
+HOME = pathlib.Path.home()
+CDUO = pathlib.Path(os.environ.get("CDUO_HOME", str(HOME / ".cduo")))
+CONFIG = CDUO / "config.json"
+STATE = CDUO / "state.json"
+LOGDIR = CDUO / "logs"
+BACKUP = CDUO / "backup"
+PROFILES = CDUO / "desktop"
+CLIROOT = CDUO / "cli"
+APP_SUPPORT = pathlib.Path(os.environ.get(
+    "CDUO_APP_SUPPORT", str(HOME / "Library/Application Support/Claude")))
+SESSIONS_ROOT = APP_SUPPORT / "claude-code-sessions"
+BUNDLE_ID = "com.anthropic.claudefordesktop"
+DESKTOP_KEYS = ("oauth:tokenCacheV2", "oauth:tokenCache", "lastKnownAccountUuid")
+COOKIE_FILES = ("Cookies", "Cookies-journal")
+PRESERVE_POINTER_KEYS = ("remoteMcpServersConfig",)
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+WINDOW = 5 * 3600
+FAKE_DESKTOP = os.environ.get("CDUO_FAKE_DESKTOP") == "1"   # 测试用：不真的退出/启动 App
+DRY_PING = os.environ.get("CDUO_DRY_PING") == "1"           # 测试用：不真的发预热
+
+DEFAULT_CONFIG = {
+    "claude_bin": None,
+    "proxy": "auto",                 # auto=跟随系统代理；""=不用；或 http://127.0.0.1:端口
+    "active_hours": {"start": "06:00", "end": "02:00"},  # 只在这段时间内自动预热
+    "switch_threshold": 95,          # 当前号用到这个百分比就建议/自动切换
+    "auto_switch": "notify",         # off=手动 | notify=提醒我 | idle=用满且空闲时自动切
+    "prewarm_enabled": True,         # 是否自动"提前开始计时"
+    "confirm_switch": True,          # 菜单栏切换前是否弹确认
+    "work_hours": None,              # {"start":"10:00","end":"01:00"}，只用于显示；active_hours 由它推出
+    "pin_org": True,                 # 换号时强制进入该账号的主组织（如 Premium Seat）
+    "projects_dirs": [str(HOME / ".claude/projects")],
+    "accounts": [],
+}
+
+MODE_TEXT = {"off": "手动", "notify": "提醒我", "idle": "自动（用满且空闲时）"}
+
+TTY = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+C = {k: (v if TTY else "") for k, v in {
+    "r": "\033[0m", "b": "\033[1m", "d": "\033[2m", "g": "\033[32m",
+    "y": "\033[33m", "red": "\033[31m", "c": "\033[36m"}.items()}
+
+
+# ───────────────────────── 基础工具 ─────────────────────────
+
+def now() -> float:
+    return time.time()
+
+
+def log(msg: str, echo: bool = False) -> None:
+    LOGDIR.mkdir(parents=True, exist_ok=True)
+    line = f"{dt.datetime.now():%Y-%m-%d %H:%M:%S} {msg}"
+    with open(LOGDIR / "cduo.log", "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+    if echo:
+        print(msg)
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"{C['red']}✗ {msg}{C['r']}", file=sys.stderr)
+    log("ERROR " + msg)
+    sys.exit(code)
+
+
+def read_json(p: pathlib.Path, default=None):
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return default
+    except Exception as e:  # 损坏的文件不要静默吞掉
+        raise RuntimeError(f"读取 {p} 失败: {e}")
+
+
+def write_json(p: pathlib.Path, data, mode: int = 0o600, indent=1) -> None:
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(f".{p.name}.tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=indent), encoding="utf-8")
+    os.chmod(tmp, mode)
+    os.replace(tmp, p)
+
+
+@contextlib.contextmanager
+def file_lock(name: str, blocking: bool = True):
+    CDUO.mkdir(parents=True, exist_ok=True)
+    fh = open(CDUO / f".{name}.lock", "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+    except BlockingIOError:
+        fh.close()
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+
+
+def parse_iso(s):
+    if not s:
+        return None
+    try:
+        return dt.datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def hhmm(ts) -> str:
+    if not ts:
+        return "--:--"
+    d = dt.datetime.fromtimestamp(ts)
+    today = dt.date.today()
+    if d.date() == today:
+        return f"{d:%H:%M}"
+    if d.date() == today + dt.timedelta(days=1):
+        return f"明天{d:%H:%M}"
+    return f"{d:%m-%d %H:%M}"
+
+
+def dur(sec) -> str:
+    if sec is None:
+        return "-"
+    sec = int(max(0, sec))
+    h, m = divmod(sec // 60, 60)
+    return f"{h}h{m:02d}m" if h else f"{m}m"
+
+
+def menubar_alive() -> bool:
+    try:
+        return now() - (CDUO / ".menubar_alive").stat().st_mtime < 90
+    except FileNotFoundError:
+        return False
+
+
+def notify(msg: str, title: str = "Cduo", kind: str = "info", target: str | None = None) -> None:
+    """菜单栏 App 在跑时交给它发（带按钮、图标统一）；否则用系统通知兜底。"""
+    if os.environ.get("CDUO_NO_NOTIFY") == "1":
+        return
+    if menubar_alive():
+        CDUO.mkdir(parents=True, exist_ok=True)
+        with open(CDUO / "notify-queue.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps({"t": now(), "title": title, "msg": msg, "kind": kind, "target": target},
+                               ensure_ascii=False) + "\n")
+        return
+    esc = lambda s: s.replace("\\", "\\\\").replace('"', '\\"')
+    subprocess.run(["osascript", "-e",
+                    f'display notification "{esc(msg)}" with title "{esc(title)}"'],
+                   capture_output=True)
+
+
+def in_desktop_app() -> bool:
+    return (os.environ.get("CLAUDE_CODE_ENTRYPOINT") == "claude-desktop"
+            or os.environ.get("__CFBundleIdentifier") == BUNDLE_ID)
+
+
+# ───────────────────────── 配置 / 状态 ─────────────────────────
+
+def load_config() -> dict:
+    cfg = read_json(CONFIG, None)
+    if cfg is None:
+        cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+    for k, v in DEFAULT_CONFIG.items():
+        cfg.setdefault(k, json.loads(json.dumps(v)))
+    return cfg
+
+
+def save_config(cfg: dict) -> None:
+    write_json(CONFIG, cfg)
+
+
+def load_state() -> dict:
+    st = read_json(STATE, None) or {}
+    st.setdefault("accounts", {})
+    return st
+
+
+def save_state(st: dict) -> None:
+    st["updated"] = now()
+    write_json(STATE, st)
+
+
+def get_account(cfg: dict, name: str) -> dict:
+    for a in cfg["accounts"]:
+        if a["name"] == name:
+            return a
+    names = ", ".join(a["name"] for a in cfg["accounts"]) or "（还没有账号）"
+    die(f"没有叫 {name} 的账号。现有：{names}")
+
+
+def profile_dir(name: str) -> pathlib.Path:
+    return PROFILES / name
+
+
+def has_profile(name: str) -> bool:
+    return (profile_dir(name) / "oauth.json").exists()
+
+
+# ───────────────────────── claude CLI / 网络 ─────────────────────────
+
+def find_claude_bin() -> str | None:
+    cands = []
+    w = shutil.which("claude")
+    if w:
+        cands.append(w)
+    cands += sorted(glob_paths(str(HOME / ".nvm/versions/node/*/bin/claude")), reverse=True)
+    cands += [str(HOME / ".local/bin/claude"), "/opt/homebrew/bin/claude", "/usr/local/bin/claude",
+              str(HOME / ".claude/local/claude")]
+    for c in cands:
+        p = pathlib.Path(c)
+        if not p.exists():
+            continue
+        try:  # 跳过 shell 包装脚本（比如会强行设置 CLAUDE_CONFIG_DIR 的那种）
+            with open(p.resolve(), "rb") as fh:
+                head = fh.read(4000)
+            if head.startswith(b"#!") and b"CLAUDE_CONFIG_DIR" in head:
+                continue
+        except Exception:
+            pass
+        return str(p)
+    # 没单独装 Claude Code 的话，用桌面版自带的那份（版本号目录会随更新变化）
+    def _ver(path):
+        try:
+            return tuple(int(x) for x in pathlib.Path(path).parts[-6].split("."))
+        except Exception:
+            return ()
+    bundled = glob_paths(str(APP_SUPPORT / "claude-code/*/*/claude.app/Contents/MacOS/claude"))
+    for c in sorted(bundled, key=_ver, reverse=True):
+        if os.access(c, os.X_OK):
+            return c
+    return None
+
+
+def glob_paths(pattern: str):
+    import glob
+    return glob.glob(pattern)
+
+
+def system_proxy() -> str | None:
+    try:
+        out = subprocess.run(["scutil", "--proxy"], capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return None
+    kv = dict(re.findall(r"^\s*(\w+)\s*:\s*(\S+)\s*$", out, re.M))
+    if kv.get("HTTPSEnable") == "1" and kv.get("HTTPSProxy"):
+        return f"http://{kv['HTTPSProxy']}:{kv.get('HTTPSPort', '80')}"
+    if kv.get("HTTPEnable") == "1" and kv.get("HTTPProxy"):
+        return f"http://{kv['HTTPProxy']}:{kv.get('HTTPPort', '80')}"
+    return None
+
+
+def proxy_url(cfg: dict) -> str | None:
+    p = cfg.get("proxy", "auto")
+    if p == "auto":
+        return system_proxy()
+    return p or None
+
+
+def clean_env(cfg: dict, cli_dir: str | None = None) -> dict:
+    """给 claude 子进程一个干净环境：去掉桌面版/中转注入的变量，只保留正常代理。"""
+    env = {}
+    for k, v in os.environ.items():
+        if k.startswith(("ANTHROPIC_", "CLAUDE_CODE_")) or k in ("CLAUDECODE", "CLAUDE_CONFIG_DIR", "__CFBundleIdentifier"):
+            continue
+        if k.lower() in ("http_proxy", "https_proxy", "all_proxy") and (":64421" in v or ":64422" in v):
+            continue  # ReClaude 的拦截代理
+        if k in ("NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR") and "/.reclaude/" in v:
+            continue
+        env[k] = v
+    px = proxy_url(cfg)
+    if px and not any(k.lower() == "https_proxy" for k in env):
+        env["HTTPS_PROXY"] = env["HTTP_PROXY"] = px
+        env.setdefault("NO_PROXY", "localhost,127.0.0.1,::1,.local")
+    path = env.get("PATH", "")
+    extra = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+    if cfg.get("claude_bin"):
+        extra.insert(0, str(pathlib.Path(cfg["claude_bin"]).parent))
+    env["PATH"] = ":".join([p for p in extra if p not in path.split(":")] + ([path] if path else []))
+    if cli_dir:
+        env["CLAUDE_CONFIG_DIR"] = cli_dir
+    return env
+
+
+def http_json(cfg: dict, url: str, data: dict | None = None, headers: dict | None = None, timeout=20):
+    px = proxy_url(cfg)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": px, "https": px} if px else {}))
+    h = {"User-Agent": "claude-cli/2.1.316 (external, cli)"}
+    h.update(headers or {})
+    body = None
+    if data is not None:
+        body = json.dumps(data).encode()
+        h["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=body, headers=h)
+    with opener.open(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+# ───────────────────────── CLI 凭据（钥匙串） ─────────────────────────
+
+def kc_service(cli_dir: str) -> str:
+    if os.path.normpath(cli_dir) == os.path.normpath(str(HOME / ".claude")):
+        return "Claude Code-credentials"
+    return "Claude Code-credentials-" + hashlib.sha256(cli_dir.encode("utf-8")).hexdigest()[:8]
+
+
+def read_creds(cli_dir: str):
+    f = pathlib.Path(cli_dir) / ".credentials.json"
+    if f.exists():
+        try:
+            return json.loads(f.read_text()), "file"
+        except Exception:
+            pass
+    out = subprocess.run(["security", "find-generic-password", "-a", os.environ.get("USER", ""),
+                          "-w", "-s", kc_service(cli_dir)], capture_output=True, text=True, timeout=10)
+    if out.returncode != 0 or not out.stdout.strip():
+        return None, None
+    try:
+        return json.loads(out.stdout.strip()), "keychain"
+    except Exception:
+        return None, None
+
+
+def write_creds(cli_dir: str, full: dict, where: str) -> None:
+    raw = json.dumps(full, separators=(",", ":"))
+    if where == "file":
+        f = pathlib.Path(cli_dir) / ".credentials.json"
+        f.write_text(raw)
+        os.chmod(f, 0o600)
+        return
+    user = os.environ.get("USER", "")
+    cmd = f'add-generic-password -U -a "{user}" -s "{kc_service(cli_dir)}" -X {raw.encode().hex()}\n'
+    p = subprocess.run(["security", "-i"], input=cmd, capture_output=True, text=True, timeout=10)
+    if p.returncode != 0:
+        raise RuntimeError("写钥匙串失败: " + p.stderr.strip())
+
+
+def cli_identity(cli_dir: str) -> dict:
+    p = pathlib.Path(cli_dir)
+    f = (HOME / ".claude.json") if os.path.normpath(cli_dir) == os.path.normpath(str(HOME / ".claude")) else p / ".claude.json"
+    a = (read_json(f, {}) or {}).get("oauthAccount") or {}
+    return {"account_uuid": a.get("accountUuid"), "org_uuid": a.get("organizationUuid"),
+            "email": a.get("emailAddress"), "org_name": a.get("organizationName")}
+
+
+def ensure_fresh_token(cfg: dict, acct: dict, force: bool = False) -> str | None:
+    """返回可用的 access token。只有 cduo 自己的 CLI 目录（owned）才会主动刷新。"""
+    cli_dir = acct["cli_dir"]
+    full, where = read_creds(cli_dir)
+    if not full or "claudeAiOauth" not in full:
+        return None
+    c = full["claudeAiOauth"]
+    fresh = c.get("expiresAt", 0) / 1000 - now() > 20 * 60
+    if fresh and not force:
+        return c.get("accessToken")
+    if not acct.get("owned") or not c.get("refreshToken"):
+        return c.get("accessToken") if fresh else None
+    lock = pathlib.Path(cli_dir) / ".oauth_refresh.lock"
+    try:
+        lock.mkdir()
+    except FileExistsError:
+        if now() - lock.stat().st_mtime < 120:
+            return None
+        shutil.rmtree(lock, ignore_errors=True)
+        lock.mkdir()
+    try:
+        r = http_json(cfg, TOKEN_URL, {"grant_type": "refresh_token", "refresh_token": c["refreshToken"],
+                                       "client_id": CLIENT_ID, "scope": " ".join(c.get("scopes") or [])}, timeout=30)
+        t = int(now() * 1000)
+        c["accessToken"] = r["access_token"]
+        c["refreshToken"] = r.get("refresh_token") or c["refreshToken"]
+        c["expiresAt"] = t + int(r["expires_in"]) * 1000
+        if r.get("refresh_token_expires_in"):
+            c["refreshTokenExpiresAt"] = t + int(r["refresh_token_expires_in"]) * 1000
+        if r.get("scope"):
+            c["scopes"] = r["scope"].split()
+        write_creds(cli_dir, full, where)
+        log(f"refreshed CLI token for {acct['name']}")
+        return c["accessToken"]
+    except Exception as e:
+        log(f"token refresh failed for {acct['name']}: {e}")
+        return None
+    finally:
+        shutil.rmtree(lock, ignore_errors=True)
+
+
+def fetch_account_usage(cfg: dict, acct: dict) -> dict:
+    res = {"fetched": now(), "util": None, "resets_at": None, "ok": False, "error": None, "no5h": False}
+    tok = ensure_fresh_token(cfg, acct)
+    if not tok:
+        res["error"] = "凭据过期/未登录"
+        return res
+    try:
+        u = http_json(cfg, USAGE_URL, headers={"Authorization": f"Bearer {tok}", "anthropic-beta": "oauth-2025-04-20"})
+    except urllib.error.HTTPError as e:
+        res["error"] = f"HTTP {e.code}"
+        return res
+    except Exception as e:
+        res["error"] = str(e)[:80]
+        return res
+    fh = u.get("five_hour")
+    res["ok"] = True
+    if not fh:
+        res["no5h"] = True
+        return res
+    res["util"] = float(fh.get("utilization") or 0)
+    res["resets_at"] = parse_iso(fh.get("resets_at"))
+    sd = u.get("seven_day")
+    if sd:
+        res["weekly_util"] = sd.get("utilization")
+        res["weekly_resets_at"] = parse_iso(sd.get("resets_at"))
+    return res
+
+
+def window_running(u: dict) -> bool:
+    return bool(u and u.get("resets_at") and u["resets_at"] > now())
+
+
+def est_resets(u: dict):
+    """窗口重置时间；接口拿不到时，用最近一次成功预热时间估算，避免反复预热。"""
+    if u and u.get("ok") and not u.get("no5h"):
+        return u["resets_at"] if window_running(u) else None
+    lp = (u or {}).get("last_ping") if (u or {}).get("last_ping_ok", True) else None
+    if lp and lp + WINDOW > now():
+        return lp + WINDOW
+    return None
+
+
+def effective_util(u: dict):
+    """窗口已过期 = 实际可用 100%。"""
+    if not u or not u.get("ok"):
+        return None
+    if u.get("no5h"):
+        return 0.0
+    return u["util"] if window_running(u) else 0.0
+
+
+def do_ping(cfg: dict, acct: dict, reason: str) -> bool:
+    claude = cfg.get("claude_bin")
+    if not claude:
+        log("ping skipped: claude_bin not set")
+        return False
+    if DRY_PING:
+        log(f"[dry] ping {acct['name']} ({reason})", echo=True)
+        return True
+    pingdir = CDUO / "ping"
+    pingdir.mkdir(parents=True, exist_ok=True)
+    cmd = [claude, "-p", "Reply with just: ok", "--model", "haiku", "--tools", "",
+           "--strict-mcp-config", "--setting-sources", "", "--no-session-persistence",
+           "--output-format", "json"]
+    try:
+        p = subprocess.run(cmd, cwd=pingdir, env=clean_env(cfg, acct["cli_dir"]),
+                           capture_output=True, text=True, timeout=180)
+        try:
+            ok = p.returncode == 0 and json.loads(p.stdout).get("is_error") is False
+        except Exception:
+            ok = False
+        log(f"ping {acct['name']} ({reason}) -> {'ok' if ok else 'FAIL'} {'' if ok else (p.stdout + p.stderr)[-300:]}")
+        return ok
+    except Exception as e:
+        log(f"ping {acct['name']} error: {e}")
+        return False
+
+
+# ───────────────────────── 桌面版：进程 ─────────────────────────
+
+def desktop_pids() -> list:
+    if FAKE_DESKTOP:
+        return []
+    # pgrep 在某些沙箱里看不到 App 进程，用 ps 按可执行路径匹配（区分大小写，避开内置的 claude.app/…/claude）
+    out = subprocess.run(["ps", "-axo", "pid=,comm="], capture_output=True, text=True).stdout
+    pids = []
+    for line in out.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) == 2 and re.search(r"/Claude\.app/Contents/MacOS/Claude$", parts[1]):
+            pids.append(int(parts[0]))
+    return pids
+
+
+def quit_desktop(timeout: int = 40) -> None:
+    if FAKE_DESKTOP or not desktop_pids():
+        return
+    subprocess.run(["osascript", "-e", f'tell application id "{BUNDLE_ID}" to quit'], capture_output=True, timeout=30)
+    t0 = now()
+    while desktop_pids() and now() - t0 < timeout:
+        time.sleep(0.5)
+    if desktop_pids():
+        for pid in desktop_pids():
+            with contextlib.suppress(Exception):
+                os.kill(pid, signal.SIGTERM)
+        t0 = now()
+        while desktop_pids() and now() - t0 < 15:
+            time.sleep(0.5)
+    if desktop_pids():
+        raise RuntimeError("Claude 桌面版退不掉，请手动退出后重试")
+    time.sleep(1.0)  # 等它把 config/cookies 刷完
+
+
+def launch_desktop() -> None:
+    if FAKE_DESKTOP:
+        return
+    subprocess.run(["open", "-b", BUNDLE_ID], capture_output=True)
+
+
+def last_transcript_write(cfg: dict) -> float:
+    newest = 0.0
+    for d in cfg.get("projects_dirs") or []:
+        base = pathlib.Path(os.path.expanduser(d))
+        if not base.is_dir():
+            continue
+        for proj in os.scandir(base):
+            if not proj.is_dir():
+                continue
+            try:
+                if proj.stat().st_mtime < newest - 5:
+                    pass
+                for e in os.scandir(proj.path):
+                    if e.name.endswith(".jsonl"):
+                        newest = max(newest, e.stat().st_mtime)
+                    elif e.is_dir():  # <session>/subagents/*.jsonl
+                        sub = os.path.join(e.path, "subagents")
+                        if os.path.isdir(sub):
+                            for s in os.scandir(sub):
+                                newest = max(newest, s.stat().st_mtime)
+            except (FileNotFoundError, PermissionError):
+                continue
+    return newest
+
+
+def wait_idle(cfg: dict, quiet: int = 12, max_wait: int = 900) -> bool:
+    t0 = now()
+    calm = 0
+    while now() - t0 < max_wait:
+        if now() - last_transcript_write(cfg) >= quiet:
+            calm += 1
+            if calm >= 2:
+                return True
+        else:
+            calm = 0
+        time.sleep(2)
+    return False
+
+
+# ───────────────────────── 桌面版：登录快照 ─────────────────────────
+
+def desktop_config_path() -> pathlib.Path:
+    return APP_SUPPORT / "config.json"
+
+
+def desktop_account_uuid():
+    return (read_json(desktop_config_path(), {}) or {}).get("lastKnownAccountUuid")
+
+
+def desktop_org_hint():
+    """桌面版最近一次上报用量时所在的组织（plan-usage-history.json）。"""
+    h = read_json(APP_SUPPORT / "plan-usage-history.json", {}) or {}
+    s = h.get("samples") or []
+    if not s:
+        return None
+    last = max(s, key=lambda x: x.get("t", 0))
+    return {"org": last.get("org"), "t": last.get("t", 0) / 1000}
+
+
+def current_desktop_profile(cfg: dict, st: dict):
+    uid = desktop_account_uuid()
+    if not uid:
+        return None
+    matches = [a["name"] for a in cfg["accounts"] if a.get("account_uuid") == uid]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        org = desktop_org_hint()
+        by_org = [a["name"] for a in cfg["accounts"] if a.get("account_uuid") == uid and a.get("org_uuid") == org]
+        if len(by_org) == 1:
+            return by_org[0]
+        if st.get("desktop_current") in matches:
+            return st["desktop_current"]
+        return matches[0]
+    return None
+
+
+def save_profile(name: str, account_uuid_expected: str | None = None) -> None:
+    """把桌面版当前登录存成快照。调用前 App 必须已退出。"""
+    conf = read_json(desktop_config_path(), {}) or {}
+    if not conf.get("oauth:tokenCacheV2") and not conf.get("oauth:tokenCache"):
+        raise RuntimeError("桌面版当前没有登录")
+    if account_uuid_expected and conf.get("lastKnownAccountUuid") != account_uuid_expected:
+        raise RuntimeError("桌面版当前登录的账号和要保存的账号对不上")
+    d = profile_dir(name)
+    d.mkdir(parents=True, exist_ok=True)
+    os.chmod(d, 0o700)
+    write_json(d / "oauth.json", {k: conf[k] for k in DESKTOP_KEYS if k in conf})
+    for fn in COOKIE_FILES:
+        src, dst = APP_SUPPORT / fn, d / fn
+        if src.exists():
+            shutil.copy2(src, dst)
+            os.chmod(dst, 0o600)
+        elif dst.exists():
+            dst.unlink()
+    write_json(d / "meta.json", {"saved_at": now(), "account_uuid": conf.get("lastKnownAccountUuid")})
+
+
+# ── 固定组织：Claude 用 lastActiveOrg cookie 记住上次的组织 ──
+# cookie 是加密的，但同一台机器上"同一个组织"的密文完全相同（固定 IV），
+# 所以只要从一份"正处于该组织"的登录里记下密文，就能写进任何账号的 Cookies。
+
+ORG_COOKIES = CDUO / "org-cookies.json"
+
+
+def _org_cookie_row(db: pathlib.Path):
+    import sqlite3
+    tmp = CDUO / f".cookies-read.{os.getpid()}"
+    shutil.copy2(db, tmp)
+    try:
+        con = sqlite3.connect(str(tmp))
+        con.row_factory = sqlite3.Row
+        r = con.execute("select * from cookies where host_key='.claude.ai' and name='lastActiveOrg'").fetchone()
+        con.close()
+        if not r:
+            return None
+        d = dict(r)
+        d["encrypted_value"] = bytes(d["encrypted_value"]).hex()
+        return d
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def current_desktop_org():
+    """桌面版当前所在组织：在桌面版会话里运行时直接读环境变量；否则看哪个组织文件夹最近有会话活动。"""
+    if in_desktop_app() and os.environ.get("CLAUDE_CODE_ORGANIZATION_UUID"):
+        return os.environ["CLAUDE_CODE_ORGANIZATION_UUID"]
+    uid = desktop_account_uuid()
+    if not uid or not (SESSIONS_ROOT / uid).is_dir():
+        return None
+    best, best_t = None, 0.0
+    for d in (SESSIONS_ROOT / uid).iterdir():
+        if not d.is_dir():
+            continue
+        for p in d.glob("local_*.json"):
+            t = p.stat().st_mtime
+            if t > best_t:
+                best, best_t = d.name, t
+    return best if now() - best_t < 3600 else None
+
+
+def learn_org_cookie(org_uuid: str) -> bool:
+    row = _org_cookie_row(APP_SUPPORT / "Cookies")
+    if not row:
+        return False
+    m = read_json(ORG_COOKIES, {}) or {}
+    for k, v in list(m.items()):   # 同一段密文不能对应两个组织
+        if k != org_uuid and v.get("encrypted_value") == row["encrypted_value"]:
+            del m[k]
+    m[org_uuid] = row
+    write_json(ORG_COOKIES, m)
+    return True
+
+
+def apply_org_cookie(db: pathlib.Path, org_uuid: str) -> bool:
+    """把 db（App 已退出时的 Cookies 文件）里的 lastActiveOrg 设成 org_uuid。"""
+    import sqlite3
+    row = (read_json(ORG_COOKIES, {}) or {}).get(org_uuid)
+    if not row or not db.exists():
+        return False
+    blob = bytes.fromhex(row["encrypted_value"])
+    row = dict({"host_key": ".claude.ai", "name": "lastActiveOrg", "path": "/", "top_frame_site_key": ""}, **row)
+    con = sqlite3.connect(str(db))
+    try:
+        cur = con.execute("update cookies set encrypted_value=?, value='' where host_key='.claude.ai' and name='lastActiveOrg'", (blob,))
+        if cur.rowcount == 0:
+            info = [(c[1], (c[2] or "").upper()) for c in con.execute("pragma table_info(cookies)")]
+            cols = [c for c, _ in info]
+            vals = [blob if c == "encrypted_value"
+                    else (row.get(c) if row.get(c) is not None else (0 if "INT" in t else ("" if "TEXT" in t else b"")))
+                    for c, t in info]
+            con.execute(f"insert into cookies ({','.join(cols)}) values ({','.join('?' * len(cols))})", vals)
+        con.commit()
+    finally:
+        con.close()
+    return True
+
+
+def pin_org_for(cfg: dict, name: str) -> None:
+    a = next((x for x in cfg["accounts"] if x["name"] == name), None)
+    if cfg.get("pin_org", True) and a and a.get("org_uuid"):
+        try:
+            if apply_org_cookie(APP_SUPPORT / "Cookies", a["org_uuid"]):
+                log(f"pinned org {a['org_uuid'][:8]} for {name}")
+        except Exception as e:   # 固定失败不影响换号
+            log(f"pin org failed for {name}: {e}")
+
+
+def restore_profile(name: str) -> None:
+    d = profile_dir(name)
+    snap = read_json(d / "oauth.json", None)
+    if not snap:
+        raise RuntimeError(f"{name} 没有桌面版登录快照，先运行 cduo capture {name}")
+    path = desktop_config_path()
+    conf = read_json(path, {}) or {}
+    for k in DESKTOP_KEYS:
+        if k in snap:
+            conf[k] = snap[k]
+        else:
+            conf.pop(k, None)
+    write_json(path, conf, mode=0o644, indent=2)
+    for fn in COOKIE_FILES:
+        src, dst = d / fn, APP_SUPPORT / fn
+        if src.exists():
+            shutil.copy2(src, dst)
+        elif dst.exists():
+            dst.unlink()
+
+
+def clear_desktop_login() -> None:
+    path = desktop_config_path()
+    conf = read_json(path, {}) or {}
+    for k in DESKTOP_KEYS:
+        conf.pop(k, None)
+    write_json(path, conf, mode=0o644, indent=2)
+    for fn in COOKIE_FILES:
+        with contextlib.suppress(FileNotFoundError):
+            (APP_SUPPORT / fn).unlink()
+
+
+def backup_desktop(tag: str) -> pathlib.Path:
+    dest = BACKUP / f"{dt.datetime.now():%Y%m%d-%H%M%S}-{tag}"
+    dest.mkdir(parents=True, exist_ok=True)
+    os.chmod(dest, 0o700)
+    for fn in ("config.json",) + COOKIE_FILES:
+        src = APP_SUPPORT / fn
+        if src.exists():
+            shutil.copy2(src, dest / fn)
+    # 只保留最近 15 份
+    olds = sorted([p for p in BACKUP.iterdir() if p.is_dir() and re.match(r"\d{8}-\d{6}-", p.name)])
+    for p in olds[:-15]:
+        shutil.rmtree(p, ignore_errors=True)
+    return dest
+
+
+# ───────────────────────── 桌面版：会话列表同步 ─────────────────────────
+
+def _uuid_of(name: str) -> str:
+    n = name
+    for pre in ("deleted_", "local_"):
+        if n.startswith(pre):
+            n = n[len(pre):]
+    return n[:-5] if n.endswith(".json") else n
+
+
+def ensure_org_folders(cfg: dict | None = None) -> int:
+    """给 cduo 管理的每个账号，在已知的每个组织下都预先建好会话文件夹。
+
+    一个登录可能属于多个组织（如 Premium Seat + 另一个组织），桌面版按 账号/组织 分文件夹，
+    在 App 里切组织时才会新建空文件夹。提前建好，切过去时会话列表就已经在了。
+    """
+    if not SESSIONS_ROOT.is_dir():
+        return 0
+    cfg = cfg or load_config()
+    accts = {a["account_uuid"] for a in cfg["accounts"] if a.get("account_uuid")}
+    orgs = {a["org_uuid"] for a in cfg["accounts"] if a.get("org_uuid")}
+    for p in SESSIONS_ROOT.glob("*/*"):
+        if p.is_dir() and re.match(r"^[0-9a-f-]{36}$", p.name):
+            orgs.add(p.name)
+    made = 0
+    for a in accts:
+        for o in orgs:
+            d = SESSIONS_ROOT / a / o
+            if not d.exists():
+                d.mkdir(parents=True, mode=0o700)
+                os.chmod(d.parent, 0o700)
+                made += 1
+    if made:
+        log(f"created {made} org session folders")
+    return made
+
+
+def sync_sessions(dry: bool = False, verbose: bool = False, missing_only: bool = False) -> dict:
+    """让每个 账号/组织 文件夹都拥有全部会话的侧边栏记录（只增不删，新的覆盖旧的）。
+
+    missing_only=True 时只补缺、不改已有记录——App 运行中也可以安全地跑。
+    """
+    summary = {"folders": 0, "copied": 0, "updated": 0, "skipped_deleted": 0}
+    if not SESSIONS_ROOT.is_dir():
+        return summary
+    if not dry:
+        ensure_org_folders()
+    folders = [p for p in SESSIONS_ROOT.glob("*/*") if p.is_dir() and not p.is_symlink()]
+    summary["folders"] = len(folders)
+    if len(folders) < 2:
+        return summary
+    deleted, entries = set(), {}
+    for f in folders:
+        for p in f.iterdir():
+            if p.name.startswith("deleted_"):
+                deleted.add(_uuid_of(p.name))
+            elif p.name.startswith("local_") and p.name.endswith(".json"):
+                try:
+                    data = json.loads(p.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                key = (data.get("lastActivityAt") or 0, p.stat().st_mtime)
+                entries.setdefault(_uuid_of(p.name), {})[f] = (p, data, key)
+    bk = None
+    written = {}  # folder -> {uid: isArchived}
+    for uid, per in entries.items():
+        datas = [d for (_, d, _) in per.values()]
+        if uid in deleted or any(d.get("cliSessionId") in deleted for d in datas):
+            summary["skipped_deleted"] += 1
+            continue
+        best_p, best, best_key = max(per.values(), key=lambda x: x[2])
+        for f in folders:
+            target = f / f"local_{uid}.json"
+            if f not in per:
+                summary["copied"] += 1
+                if verbose:
+                    print(f"  + {best.get('title') or uid}  →  {f.parent.name[:8]}/{f.name[:8]}")
+                if not dry:
+                    _write_pointer(target, best)
+                    written.setdefault(f, {})[uid] = bool(best.get("isArchived"))
+                continue
+            p, cur, key = per[f]
+            if not missing_only and key[0] < best_key[0] and cur != best:
+                merged = dict(best)
+                for k in PRESERVE_POINTER_KEYS:
+                    if k in cur:
+                        merged[k] = cur[k]
+                summary["updated"] += 1
+                if verbose:
+                    print(f"  ↻ {best.get('title') or uid}  →  {f.parent.name[:8]}/{f.name[:8]}")
+                if not dry:
+                    if bk is None:
+                        bk = BACKUP / f"{dt.datetime.now():%Y%m%d-%H%M%S}-sessions"
+                    dst = bk / f.parent.name / f.name
+                    dst.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(p, dst / p.name)
+                    _write_pointer(target, merged)
+                    written.setdefault(f, {})[uid] = bool(merged.get("isArchived"))
+    for f, ws in written.items():  # 归档索引与会话里的 isArchived 保持一致
+        idx_p = f / "archived-sessions.idx"
+        idx = read_json(idx_p, None) or {"v": 1, "archived": []}
+        arch = list(idx.get("archived") or [])
+        for uid, is_arch in ws.items():
+            sid = f"local_{uid}"
+            if is_arch and sid not in arch:
+                arch.append(sid)
+            elif not is_arch and sid in arch:
+                arch.remove(sid)
+        if arch != (idx.get("archived") or []) or (arch and not idx_p.exists()):
+            idx["archived"] = arch
+            _write_pointer(idx_p, idx)
+    if not dry and (summary["copied"] or summary["updated"]):
+        log(f"sync_sessions {summary}")
+    return summary
+
+
+def _write_pointer(target: pathlib.Path, data: dict) -> None:
+    tmp = target.with_name(f".{target.name}.cduo.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, target)
+
+
+# ───────────────────────── 调度：EDF 推荐 + 错峰预热 ─────────────────────────
+
+def in_active_hours(cfg: dict, t: float | None = None) -> bool:
+    ah = cfg.get("active_hours") or {}
+    s, e = ah.get("start", "00:00"), ah.get("end", "24:00")
+    d = dt.datetime.fromtimestamp(t or now())
+    m = d.hour * 60 + d.minute
+    tm = lambda x: int(x.split(":")[0]) * 60 + int(x.split(":")[1])
+    a, b = tm(s), tm(e)
+    if a == b:
+        return True
+    return a <= m < b if a < b else (m >= a or m < b)
+
+
+def prewarm_accounts(cfg: dict) -> list:
+    return [a for a in cfg["accounts"] if a.get("prewarm", True)]
+
+
+def lbl(cfg: dict, name) -> str:
+    """显示名：优先用备注。"""
+    if not name:
+        return "?"
+    a = next((x for x in cfg["accounts"] if x["name"] == name), None)
+    return (a.get("label") or name) if a else name
+
+
+def plan_pings(cfg: dict, st: dict):
+    """返回 (要立刻预热的账号, 说明, 下一次预计预热时间)。
+
+    规则：n 个账号的重置时刻在 5h 内均匀错开（2 个号=相隔 2.5h）。
+    - 都没在计时：先启动桌面版当前在用的那个；
+    - 有在计时的：当最近启动的那个窗口已经跑了 5h/n，就启动下一个空闲账号。
+    """
+    accts = prewarm_accounts(cfg)
+    if not accts:
+        return None, "没有参与预热的账号", None
+    n = len(accts)
+    gap = WINDOW / n
+    rs = {a["name"]: est_resets(st["accounts"].get(a["name"], {})) for a in accts}
+    running = [a for a in accts if rs[a["name"]]]
+    idle = [a for a in accts if not rs[a["name"]]]
+    if not idle:
+        return None, "两个号都在计时，刷新时间已错开", None
+    cur = st.get("desktop_current")
+    idle.sort(key=lambda a: (0 if a["name"] == cur else 1, accts.index(a)))
+    first = lbl(cfg, idle[0]["name"])
+    if not running:
+        return idle[0], f"现在让 {first} 开始计时", now()
+    latest = max(rs[a["name"]] for a in running)
+    due = latest - (WINDOW - gap)
+    if now() >= due:
+        return idle[0], f"现在让 {first} 开始计时（与另一个号错开 {dur(gap)}）", due
+    return None, f"{first} 将在 {hhmm(due)} 自动开始计时（错开 {dur(gap)}）", due
+
+
+def recommend(cfg: dict, st: dict) -> dict:
+    """用'最早过期优先'（EDF）决定桌面版该用哪个号，带防抖。"""
+    thr = float(cfg.get("switch_threshold", 95))
+    cur = st.get("desktop_current")
+    cands = [a for a in cfg["accounts"] if has_profile(a["name"])]
+    if not cands:
+        return {"action": "none", "reason": "还没有桌面版登录快照"}
+    info = {}
+    for a in cands:
+        u = st["accounts"].get(a["name"], {})
+        eu = effective_util(u)
+        info[a["name"]] = {"util": eu, "running": window_running(u), "resets": u.get("resets_at") if window_running(u) else None}
+    usable = [n for n, i in info.items() if i["util"] is None or i["util"] < thr]
+    if not usable:
+        soon = min((i["resets"] for i in info.values() if i["resets"]), default=None)
+        return {"action": "wait", "target": None, "reason": f"两个号都快用完了，{hhmm(soon)} 恢复"}
+    rank = sorted(usable, key=lambda n: (0 if info[n]["running"] else 1, info[n]["resets"] or 9e12,
+                                         0 if n == cur else 1))
+    best = rank[0]
+    if cur not in usable:
+        why = (f"{lbl(cfg, cur)} 已用 {info[cur]['util']:.0f}%" if cur in info and info[cur]["util"] is not None
+               else "当前号不可用")
+        return {"action": "switch", "target": best, "urgent": True, "reason": why}
+    if best != cur and info[best]["running"] and info[best]["util"] is not None:
+        left = 100 - info[best]["util"]
+        soon = info[best]["resets"] - now() <= 90 * 60
+        cur_later = (not info[cur]["running"]) or (info[cur]["resets"] or 0) - info[best]["resets"] >= 30 * 60
+        if soon and left >= 25 and cur_later:
+            return {"action": "switch", "target": best, "urgent": False,
+                    "reason": f"{lbl(cfg, best)} 还剩 {left:.0f}%，{hhmm(info[best]['resets'])} 刷新后就作废，先用它"}
+    return {"action": "stay", "target": cur, "reason": "当前用的就是最合适的号"}
+
+
+def tick(cfg: dict, verbose: bool = False, allow_ping: bool = True) -> dict:
+    with file_lock("tick", blocking=False) as got:
+        if not got:
+            return load_state()
+        st = load_state()
+        for a in cfg["accounts"]:
+            prev = st["accounts"].get(a["name"], {})
+            u = fetch_account_usage(cfg, a)
+            u["last_ping"] = prev.get("last_ping")
+            u["last_ping_ok"] = prev.get("last_ping_ok", True)
+            st["accounts"][a["name"]] = u
+        cur = current_desktop_profile(cfg, st)
+        if cur:
+            st["desktop_current"] = cur
+        st["desktop_org"] = desktop_org_hint()
+        try:   # 自动记住"主组织"的 cookie，用于换号时固定组织
+            a_cur = next((x for x in cfg["accounts"] if x["name"] == cur), None) if cur else None
+            if a_cur and a_cur.get("org_uuid") and a_cur["org_uuid"] not in (read_json(ORG_COOKIES, {}) or {}) \
+                    and current_desktop_org() == a_cur["org_uuid"]:
+                if learn_org_cookie(a_cur["org_uuid"]):
+                    log(f"learned org cookie for {a_cur.get('org_name')}")
+        except Exception as e:
+            log(f"learn org cookie failed: {e}")
+        try:   # 在 App 里新切了组织 → 5 分钟内把会话列表补过去
+            sync_sessions(missing_only=True)
+        except Exception as e:
+            log(f"background sync failed: {e}")
+        pinged = None
+        acct, why, due = plan_pings(cfg, st)
+        active = in_active_hours(cfg)
+        enabled = cfg.get("prewarm_enabled", True)
+        if allow_ping and active and acct and enabled:
+            u0 = st["accounts"][acct["name"]]
+            backoff = 15 * 60 if u0.get("last_ping_ok", True) else 60 * 60
+            if now() - (u0.get("last_ping") or 0) > backoff:
+                okp = do_ping(cfg, acct, why)
+                if okp:
+                    pinged = acct["name"]
+                nu = fetch_account_usage(cfg, acct)
+                nu["last_ping"], nu["last_ping_ok"] = now(), okp
+                st["accounts"][acct["name"]] = nu
+                acct, why, due = plan_pings(cfg, st)
+        if not enabled:
+            why = "自动提前计时已关闭"
+        elif not active:
+            why = f"现在不在自动计时时段（{cfg['active_hours']['start']}–{cfg['active_hours']['end']}）"
+        idle_next = [x["name"] for x in prewarm_accounts(cfg) if not est_resets(st["accounts"].get(x["name"], {}))]
+        idle_next.sort(key=lambda n: 0 if n == st.get("desktop_current") else 1)
+        st["next_ping"] = {"at": due if enabled else None, "why": why,
+                           "name": acct["name"] if acct else (idle_next[0] if idle_next else None)}
+        rec = recommend(cfg, st)
+        st["recommend"] = rec
+        key = f"{rec.get('action')}:{rec.get('target')}"
+        mode = cfg.get("auto_switch", "notify")
+        auto_now = rec.get("action") == "switch" and rec.get("urgent") and mode == "idle"
+        if rec.get("action") == "switch" and st.get("last_notified") != key and mode != "off" and not auto_now:
+            notify(rec["reason"], f"建议切换到 {lbl(cfg, rec['target'])}", kind="suggest", target=rec["target"])
+            st["last_notified"] = key
+        elif rec.get("action") != "switch":
+            st["last_notified"] = None
+        save_state(st)
+        if pinged:
+            log(f"tick: pinged {pinged}")
+    if auto_now:
+        running = bool(desktop_pids())
+        idle_for = now() - last_transcript_write(cfg)
+        if not running or idle_for > 180:   # App 没开就直接换好，下次打开即是新号
+            log(f"auto-switch to {rec['target']} ({rec['reason']}, app {'running' if running else 'closed'})")
+            try:
+                do_switch(cfg, rec["target"], after_turn=running, relaunch=running)
+            except SystemExit:
+                pass
+            except Exception as e:
+                log(f"auto-switch failed: {e}")
+    return load_state()
+
+
+# ───────────────────────── 切换 ─────────────────────────
+
+def spawn_detached(args: list) -> None:
+    LOGDIR.mkdir(parents=True, exist_ok=True)
+    out = open(LOGDIR / "switch.log", "a")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE_CODE_")}
+    subprocess.Popen([sys.executable, os.path.abspath(__file__)] + args, stdin=subprocess.DEVNULL,
+                     stdout=out, stderr=out, start_new_session=True, env=env, cwd=str(HOME))
+
+
+def do_switch(cfg: dict, target: str, after_turn: bool = False, relaunch: bool = True, force: bool = False) -> None:
+    get_account(cfg, target)
+    if not has_profile(target):
+        die(f"{target} 还没有桌面版登录快照。先在桌面版登录它，然后运行 cduo capture {target}")
+    st = load_state()
+    cur = current_desktop_profile(cfg, st)
+    if cur == target and not force:
+        print(f"桌面版已经是 {lbl(cfg, target)}")
+        return
+    T = lbl(cfg, target)
+
+    def phase(p):  # 给菜单栏看的进度
+        s = load_state()
+        s["switching"] = {"to": target, "phase": p, "since": now()} if p else None
+        save_state(s)
+
+    if after_turn and desktop_pids():
+        phase("waiting")
+        log(f"switch→{target}: waiting for idle")
+        if not wait_idle(cfg):
+            phase(None)
+            notify("Claude 一直在回复，切换已取消，稍后再试", "切换取消")
+            die("等了 15 分钟仍在忙，取消切换")
+    with file_lock("switch"):
+        was_running = bool(desktop_pids())
+        phase("restarting")
+        notify("Claude 会自动重启，约 10 秒", f"正在切换到 {T}")
+        quit_desktop()
+        backup_desktop(f"to-{target}")
+        try:
+            if cur:
+                save_profile(cur)          # 桌面版会轮换 token，必须先把最新的存回去
+            elif desktop_account_uuid() and not force:
+                raise RuntimeError("桌面版当前登录的账号不在 cduo 里，为免丢失登录已取消。先 cduo capture <名字>")
+            restore_profile(target)
+            pin_org_for(cfg, target)
+            s = sync_sessions()
+        except Exception as e:
+            phase(None)
+            if was_running:
+                launch_desktop()
+            die(str(e))
+        st = load_state()
+        st["desktop_current"] = target
+        st["last_switch"] = {"at": now(), "from": cur, "to": target}
+        st["last_notified"] = None
+        st["switching"] = None
+        save_state(st)
+        if relaunch and (was_running or not FAKE_DESKTOP):
+            launch_desktop()
+    msg = f"已切换到 {T}"
+    log(f"switch {cur} -> {target} {s}")
+    notify("点开原来的会话就能接着聊", msg)
+    print(f"{C['g']}✓ {msg}{C['r']}")
+
+
+# ───────────────────────── 命令 ─────────────────────────
+
+def cmd_status(args, cfg):
+    st = tick(cfg, allow_ping=False) if not args.cached else load_state()
+    if args.json:
+        sw = st.get("switching")
+        if sw and now() - sw.get("since", 0) > 20 * 60:   # 过期的进度标记
+            sw = None
+        out = {"accounts": [], "recommend": st.get("recommend"), "next_ping": st.get("next_ping"),
+               "desktop_current": st.get("desktop_current"), "updated": st.get("updated"),
+               "switching": sw, "version": VERSION,
+               "settings": {"auto_switch": cfg.get("auto_switch", "notify"),
+                            "switch_threshold": cfg.get("switch_threshold", 95),
+                            "prewarm_enabled": cfg.get("prewarm_enabled", True),
+                            "confirm_switch": cfg.get("confirm_switch", True),
+                            "work_hours": cfg.get("work_hours"),
+                            "login_item": login_item_enabled(),
+                            "pin_org": cfg.get("pin_org", True),
+                            "pin_org_ready": all(a.get("org_uuid") in (read_json(ORG_COOKIES, {}) or {})
+                                                 for a in cfg["accounts"] if a.get("org_uuid")),
+                            "org_names": sorted({a.get("org_name") for a in cfg["accounts"] if a.get("org_name")}),
+                            "active_hours": cfg.get("active_hours")},
+               "in_active_hours": in_active_hours(cfg)}
+        if out["recommend"] and out["recommend"].get("target"):
+            out["recommend"]["target_label"] = lbl(cfg, out["recommend"]["target"])
+        for a in cfg["accounts"]:
+            u = st["accounts"].get(a["name"], {})
+            out["accounts"].append({"name": a["name"], "label": a.get("label") or a["name"],
+                                    "email": a.get("email"),
+                                    "util": effective_util(u), "running": window_running(u),
+                                    "resets_at": u.get("resets_at") if window_running(u) else None,
+                                    "error": u.get("error"), "has_profile": has_profile(a["name"]),
+                                    "desktop_current": st.get("desktop_current") == a["name"],
+                                    "last_ping": u.get("last_ping")})
+        print(json.dumps(out, ensure_ascii=False))
+        return
+    if not cfg["accounts"]:
+        print("还没有账号。运行 cduo setup 开始配置。")
+        return
+    print(f"{C['b']}Cduo{C['r']}  {dt.datetime.now():%H:%M}   切换方式：{MODE_TEXT.get(cfg.get('auto_switch'), '?')}")
+    for a in cfg["accounts"]:
+        u = st["accounts"].get(a["name"], {})
+        mark = f"{C['c']}●{C['r']}" if st.get("desktop_current") == a["name"] else " "
+        eu = effective_util(u)
+        if eu is None:
+            bar = f"{C['y']}?  {u.get('error') or '无数据'}{C['r']}"
+        else:
+            col = C["g"] if eu < 70 else (C["y"] if eu < 95 else C["red"])
+            filled = int(round(eu / 10))
+            when = (f"{hhmm(u['resets_at'])} 刷新额度（还有 {dur(u['resets_at'] - now())}）" if window_running(u)
+                    else "满额，还没开始计时")
+            bar = f"{col}{'█' * filled}{'░' * (10 - filled)} 已用 {eu:3.0f}%{C['r']}  {when}"
+        prof = "" if has_profile(a["name"]) else f"  {C['d']}(未保存桌面登录){C['r']}"
+        print(f" {mark} {(a.get('label') or a['name']):<8} {bar}{prof}")
+    rec = st.get("recommend") or {}
+    np_ = st.get("next_ping") or {}
+    if rec.get("action") == "switch":
+        print(f" {C['y']}⇄ 建议切换到 {lbl(cfg, rec['target'])}：{rec['reason']}{C['r']}   → cduo switch {rec['target']}")
+    elif rec.get("action") == "wait":
+        print(f" {C['red']}⏸ {rec['reason']}{C['r']}")
+    if np_.get("why"):
+        print(f" {C['d']}{np_['why']}{C['r']}")
+    hint = st.get("desktop_org") if isinstance(st.get("desktop_org"), dict) else None
+    cur = st.get("desktop_current")
+    since = max((st.get("last_switch") or {}).get("at", 0),
+                (read_json(profile_dir(cur) / "meta.json", {}) or {}).get("saved_at", 0) if cur else 0)
+    if cur and hint and hint.get("t", 0) > since:   # 只看切换之后桌面版上报的组织，避免误报
+        a = next((x for x in cfg["accounts"] if x["name"] == cur), None)
+        if a and a.get("org_uuid") and a["org_uuid"] != hint.get("org"):
+            print(f" {C['y']}! 桌面版当前所在组织不是 {cur} 的组织（可能在同一登录的另一个组织里），额度数字可能对不上{C['r']}")
+
+
+def cmd_switch(args, cfg):
+    st = load_state()
+    target = args.name
+    if not target:
+        st = tick(cfg, allow_ping=False)
+        rec = st.get("recommend") or {}
+        if rec.get("action") == "switch":
+            target = rec["target"]
+        else:
+            cur = current_desktop_profile(cfg, st)
+            others = [a["name"] for a in cfg["accounts"] if a["name"] != cur and has_profile(a["name"])]
+            if not others:
+                die("没有可切换的另一个账号（需要先保存桌面登录快照）")
+            target = others[0]
+    if in_desktop_app() and not args.detached:
+        spawn_detached(["switch", target, "--after-turn", "--detached"] + (["--force"] if args.force else []))
+        print(f"好的：等这一轮回复结束后（约十几秒），Claude 会自动重启并切到 {target}。"
+              f"重启后点开原来的会话就能接着聊。")
+        return
+    do_switch(cfg, target, after_turn=args.after_turn, relaunch=not args.no_relaunch, force=args.force)
+
+
+def _with_app_closed(cfg, fn, tag: str):
+    was = bool(desktop_pids())
+    quit_desktop()
+    backup_desktop(tag)
+    try:
+        fn()
+    finally:
+        if was or not FAKE_DESKTOP:
+            launch_desktop()
+
+
+def cmd_capture(args, cfg):
+    a = get_account(cfg, args.name)
+    if in_desktop_app() and not args.detached:
+        spawn_detached(["capture", args.name, "--detached"] + (["--force"] if args.force else []))
+        print("好的：这一轮结束后 Claude 会重启一下，用来保存当前登录。")
+        return
+    uid = desktop_account_uuid()
+    if a.get("account_uuid") and uid and uid != a["account_uuid"] and not args.force:
+        other = next((x["name"] for x in cfg["accounts"] if x.get("account_uuid") == uid), None)
+        die(f"桌面版现在登录的不是 {args.name}" + (f"，而是 {other}" if other else "") + "。（确定要存就加 --force）")
+    if args.detached:
+        wait_idle(cfg)
+
+    def run():
+        save_profile(args.name)
+        st = load_state()
+        st["desktop_current"] = args.name
+        save_state(st)
+        sync_sessions()
+
+    _with_app_closed(cfg, run, f"capture-{args.name}")
+    print(f"{C['g']}✓ 已保存 {args.name} 的桌面版登录{C['r']}")
+    log(f"captured desktop profile {args.name}")
+    notify(f"已保存 {args.name} 的桌面版登录")
+
+
+def cmd_desktop_login(args, cfg):
+    """为新账号准备：存好当前登录后，让桌面版以'未登录'状态打开。"""
+    get_account(cfg, args.name)
+    if in_desktop_app():
+        die("这个命令会关掉 Claude 桌面版，请在 macOS 自带的「终端」App（Terminal.app）里运行")
+    st = load_state()
+    cur = current_desktop_profile(cfg, st)
+    if desktop_account_uuid() and not cur:
+        die("桌面版当前登录的账号还没被 cduo 保存，先 cduo capture <它的名字>，否则会丢登录")
+
+    def run():
+        if cur:
+            save_profile(cur)
+        clear_desktop_login()
+
+    _with_app_closed(cfg, run, f"login-{args.name}")
+    print(f"Claude 已以未登录状态打开。请在里面登录【{args.name}】对应的账号"
+          f"（不要点任何'退出登录'）。登录完成后回到这里。")
+
+
+def cmd_add(args, cfg):
+    if any(a["name"] == args.name for a in cfg["accounts"]):
+        die(f"{args.name} 已存在")
+    if not re.match(r"^[A-Za-z0-9_-]{1,16}$", args.name):
+        die("名字只能用字母/数字/-/_，最长 16")
+    owned = not args.cli_dir
+    cli_dir = os.path.abspath(os.path.expanduser(args.cli_dir)) if args.cli_dir else str(CLIROOT / args.name)
+    pathlib.Path(cli_dir).mkdir(parents=True, exist_ok=True)
+    a = {"name": args.name, "label": args.label or args.name, "cli_dir": cli_dir, "owned": owned, "prewarm": True}
+    a.update({k: v for k, v in cli_identity(cli_dir).items() if v})
+    cfg["accounts"].append(a)
+    save_config(cfg)
+    print(f"✓ 已添加 {args.name}（CLI 目录 {cli_dir}）")
+
+
+def cli_login(cfg, a) -> bool:
+    claude = cfg.get("claude_bin")
+    if not claude:
+        die("找不到 claude 命令，用 cduo config claude_bin <路径> 设置")
+    print(f"→ 打开浏览器登录【{a['name']}】的 Claude 账号（Claude Code 授权页）…")
+    r = subprocess.run([claude, "auth", "login", "--claudeai"], env=clean_env(cfg, a["cli_dir"]))
+    if r.returncode != 0:
+        print("登录没有完成")
+        return False
+    a.update({k: v for k, v in cli_identity(a["cli_dir"]).items() if v})
+    save_config(cfg)
+    print(f"{C['g']}✓ CLI 已登录：{a.get('email')} · {a.get('org_name')}{C['r']}")
+    return True
+
+
+def cmd_login(args, cfg):
+    cli_login(cfg, get_account(cfg, args.name))
+
+
+def cmd_ping(args, cfg):
+    a = get_account(cfg, args.name)
+    ok = do_ping(cfg, a, "手动")
+    st = load_state()
+    u = fetch_account_usage(cfg, a)
+    u["last_ping"], u["last_ping_ok"] = now(), ok
+    st["accounts"][a["name"]] = u
+    save_state(st)
+    print(("✓ 已预热 " if ok else "✗ 预热失败 ") + a["name"] +
+          (f"，窗口 {hhmm(u['resets_at'])} 重置" if window_running(u) else ""))
+
+
+def cmd_sync(args, cfg):
+    s = sync_sessions(dry=args.dry_run, verbose=True)
+    print(("（预演）" if args.dry_run else "") +
+          f"{s['folders']} 个账号/组织文件夹；新增 {s['copied']}，更新 {s['updated']}，跳过已删除 {s['skipped_deleted']}")
+
+
+def cmd_tick(args, cfg):
+    st = tick(cfg, verbose=True)
+    if args.verbose:
+        cmd_status(argparse.Namespace(json=False, cached=True), cfg)
+
+
+def cmd_config(args, cfg):
+    if not args.key:
+        print(json.dumps({k: v for k, v in cfg.items() if k != "accounts"}, ensure_ascii=False, indent=1))
+        return
+    key, val = args.key, args.value
+    if val is None:
+        print(json.dumps(cfg.get(key), ensure_ascii=False))
+        return
+    onoff = lambda v: v.lower() in ("on", "1", "true", "yes", "开")
+    if key == "active_hours":
+        s, e = val.split("-")
+        cfg["active_hours"] = {"start": norm_hhmm(s), "end": norm_hhmm(e)}
+    elif key == "work_hours":   # 开工-收工；自动计时从开工前 4 小时开始
+        s, e = (norm_hhmm(x) for x in val.split("-"))
+        cfg["work_hours"] = {"start": s, "end": e}
+        h, m = map(int, s.split(":"))
+        cfg["active_hours"] = {"start": f"{(h - 4) % 24:02d}:{m:02d}", "end": e}
+    elif key == "switch_threshold":
+        cfg[key] = float(val)
+    elif key == "auto_switch":
+        if val not in ("off", "notify", "idle"):
+            die("auto_switch 只能是 off / notify / idle")
+        cfg[key] = val
+    elif key in ("prewarm_enabled", "confirm_switch", "pin_org"):
+        cfg[key] = onoff(val)
+    elif key in ("proxy", "claude_bin"):
+        cfg[key] = val
+    else:
+        die(f"不认识的配置项 {key}")
+    save_config(cfg)
+    print(f"✓ {key} = {json.dumps(cfg[key], ensure_ascii=False)}")
+
+
+def norm_hhmm(t: str) -> str:
+    t = t.replace("：", ":").strip()
+    if ":" not in t:
+        t += ":00"
+    hh, mm = map(int, t.split(":"))
+    return f"{hh % 24:02d}:{mm:02d}"
+
+
+def cmd_pin_org(args, cfg):
+    """记住桌面版当前所在组织（应当是主组织，如 Premium Seat），并开启固定。"""
+    org = current_desktop_org()
+    st = load_state()
+    cur = current_desktop_profile(cfg, st)
+    a = next((x for x in cfg["accounts"] if x["name"] == cur), None)
+    if not a:
+        die("认不出桌面版当前是哪个号")
+    if not org:
+        die("判断不出桌面版当前在哪个组织。请在 Claude 里切到主组织、随便发一条消息后再试")
+    if org != a.get("org_uuid"):
+        die(f"桌面版当前不在 {a.get('org_name')}。请先在 Claude 左下角切到 {a.get('org_name')} 再运行")
+    if not learn_org_cookie(org):
+        die("没读到组织 cookie")
+    cfg["pin_org"] = True
+    save_config(cfg)
+    print(f"✓ 已固定：以后换号都会进入「{a.get('org_name')}」")
+
+
+def cmd_rename(args, cfg):
+    a = get_account(cfg, args.name)
+    a["label"] = args.label.strip()[:12] or a["name"]
+    save_config(cfg)
+    print(f"✓ {args.name} 显示为「{a['label']}」")
+
+
+# ── launchd ──
+
+AGENT_TICK = "com.cduo.tick"
+AGENT_MENU = "com.cduo.menubar"
+
+
+def agent_path(label: str) -> pathlib.Path:
+    return HOME / "Library/LaunchAgents" / f"{label}.plist"
+
+
+def menubar_exe() -> pathlib.Path:
+    for base in ("/Applications", str(HOME / "Applications")):
+        p = pathlib.Path(base) / "Cduo.app/Contents/MacOS/Cduo"
+        if p.exists():
+            return p
+    return CDUO / "app" / "cduo-menubar"
+
+
+def login_item_enabled() -> bool:
+    out = subprocess.run(["launchctl", "print-disabled", f"gui/{os.getuid()}"], capture_output=True, text=True).stdout
+    m = re.search(r'"%s"\s*=>\s*(\w+)' % re.escape(AGENT_MENU), out)
+    if m and m.group(1) in ("disabled", "true"):
+        return False
+    return agent_path(AGENT_MENU).exists()
+
+
+def install_agents(menubar: bool = True) -> None:
+    LOGDIR.mkdir(parents=True, exist_ok=True)
+    me = str(CDUO / "app" / "cduo")
+    if not os.path.exists(me):
+        me = os.path.abspath(__file__)
+    uid = os.getuid()
+    plists = {AGENT_TICK: {
+        "Label": AGENT_TICK, "ProgramArguments": ["/usr/bin/python3", me, "tick"],
+        "StartInterval": 300, "RunAtLoad": True, "ProcessType": "Background",
+        "StandardOutPath": str(LOGDIR / "tick.out"), "StandardErrorPath": str(LOGDIR / "tick.out"),
+        "EnvironmentVariables": {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"}}}
+    mb = menubar_exe()
+    if menubar and mb.exists():
+        plists[AGENT_MENU] = {
+            "Label": AGENT_MENU, "ProgramArguments": [str(mb)], "RunAtLoad": True,
+            "KeepAlive": {"SuccessfulExit": False}, "ProcessType": "Interactive",
+            "StandardOutPath": str(LOGDIR / "menubar.out"), "StandardErrorPath": str(LOGDIR / "menubar.out"),
+            "EnvironmentVariables": {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "CDUO_BIN": me}}
+    for label, pl in plists.items():
+        p = agent_path(label)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["launchctl", "bootout", f"gui/{uid}/{label}"], capture_output=True)
+        with open(p, "wb") as f:
+            plistlib.dump(pl, f)
+        subprocess.run(["launchctl", "enable", f"gui/{uid}/{label}"], capture_output=True)
+        r = subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", str(p)], capture_output=True, text=True)
+        print(("✓ 已启用 " if r.returncode == 0 else "✗ 启用失败 ") + label + ("" if r.returncode == 0 else " " + r.stderr.strip()))
+
+
+def uninstall_agents() -> None:
+    uid = os.getuid()
+    for label in (AGENT_TICK, AGENT_MENU):
+        subprocess.run(["launchctl", "bootout", f"gui/{uid}/{label}"], capture_output=True)
+        with contextlib.suppress(FileNotFoundError):
+            agent_path(label).unlink()
+        print(f"✓ 已移除 {label}")
+
+
+def cmd_agents(args, cfg):
+    if args.action in ("login-on", "login-off"):
+        on = args.action == "login-on"
+        subprocess.run(["launchctl", "enable" if on else "disable", f"gui/{os.getuid()}/{AGENT_MENU}"], capture_output=True)
+        print("✓ 开机自动启动菜单栏：" + ("开" if on else "关"))
+        return
+    if args.action == "install":
+        install_agents(menubar=not args.no_menubar)
+    elif args.action == "uninstall":
+        uninstall_agents()
+    else:
+        for label in (AGENT_TICK, AGENT_MENU):
+            r = subprocess.run(["launchctl", "print", f"gui/{os.getuid()}/{label}"], capture_output=True, text=True)
+            if r.returncode:
+                desc = "未安装"
+            elif label == AGENT_TICK:
+                runs = re.search(r"runs = (\d+)", r.stdout)
+                desc = f"已安装，每 5 分钟跑一次（已运行 {runs.group(1) if runs else '?'} 次）"
+            else:
+                desc = "运行中" if re.search(r"state = running", r.stdout) else "已安装但未运行"
+            print(f"{label}: {desc}")
+
+
+def cmd_doctor(args, cfg):
+    ok = lambda b: f"{C['g']}✓{C['r']}" if b else f"{C['red']}✗{C['r']}"
+    print(f"cduo {VERSION}  数据目录 {CDUO}")
+    cb = cfg.get("claude_bin")
+    print(f" {ok(cb and os.path.exists(cb))} claude 命令: {cb}")
+    print(f" {ok(True)} 代理: {proxy_url(cfg) or '不使用'}")
+    print(f" {ok(desktop_config_path().exists())} 桌面版数据: {APP_SUPPORT}")
+    print(f"   桌面版当前账号: {current_desktop_profile(cfg, load_state()) or desktop_account_uuid() or '未登录'}"
+          f"   （App {'运行中' if desktop_pids() else '未运行'}）")
+    for a in cfg["accounts"]:
+        full, where = read_creds(a["cli_dir"])
+        c = (full or {}).get("claudeAiOauth") or {}
+        exp = c.get("expiresAt", 0) / 1000
+        rexp = c.get("refreshTokenExpiresAt", 0) / 1000
+        print(f" {ok(bool(c))} {a['name']}: {a.get('email')} · {a.get('org_name')}  CLI {'自有目录' if a.get('owned') else '共用目录'}")
+        if c:
+            print(f"     access token {'有效' if exp > now() else '已过期'}；refresh token "
+                  + (f"还剩 {dur(rexp - now())}" if rexp else "未知") + ("（cduo 会自动续期）" if a.get("owned") else "（共用目录不主动续期，预热时由 claude 自己续）"))
+        u = fetch_account_usage(cfg, a)
+        print(f"     额度接口: " + (f"OK，5h 已用 {effective_util(u):.0f}%" if u.get("ok") and not u.get("no5h") else (u.get("error") or "无 5h 窗口")))
+        print(f"     桌面登录快照: " + ("已保存 " + hhmm((read_json(profile_dir(a['name']) / 'meta.json', {}) or {}).get('saved_at')) if has_profile(a["name"]) else "未保存"))
+    cmd_agents(argparse.Namespace(action="status"), cfg)
+
+
+def ask(prompt: str, default: str = "") -> str:
+    s = input(f"{prompt}" + (f" [{default}]" if default else "") + ": ").strip()
+    return s or default
+
+
+def cmd_setup(args, cfg):
+    if in_desktop_app():
+        die("setup 过程中需要重启 Claude 桌面版，请在 macOS 自带的「终端」App（Terminal.app，不是 Claude 里的终端面板）运行：cduo setup")
+    print(f"{C['b']}cduo 设置向导{C['r']}（随时 Ctrl-C 退出，重新运行会接着来）\n")
+    if not cfg.get("claude_bin"):
+        cfg["claude_bin"] = find_claude_bin()
+    print(f"claude 命令: {cfg.get('claude_bin') or '没找到'}")
+    if not cfg.get("claude_bin"):
+        cfg["claude_bin"] = ask("请输入 claude 可执行文件的完整路径")
+    print(f"代理: {proxy_url(cfg) or '不使用'}（跟随系统设置）\n")
+    def norm(t):
+        t = t.replace("：", ":").strip()
+        if ":" not in t:
+            t += ":00"
+        hh, mm = map(int, t.split(":"))
+        return f"{hh % 24:02d}:{mm:02d}"
+    ws = norm(ask("你一般几点开始用 Claude？(HH:MM)", "10:00"))
+    we = norm(ask("一般几点收工？(HH:MM)", "01:00"))
+    h, m = map(int, ws.split(":"))
+    start = f"{(h - 4) % 24:02d}:{m:02d}"
+    cfg["active_hours"] = {"start": start, "end": we}
+    cfg["work_hours"] = {"start": ws, "end": we}
+    print(f"→ 自动预热时段设为 {start}–{we}（开工前约 4 小时预热第一个号，开工后约 1 小时就会有一次额度刷新）\n")
+    save_config(cfg)
+
+    while len(cfg["accounts"]) < 2:
+        i = len(cfg["accounts"]) + 1
+        print(f"{C['b']}— 第 {i} 个账号 —{C['r']}")
+        name = ask("给它起个短名字（字母/数字，如 neu、me）")
+        label = ask("备注（可选）", name)
+        reuse = ask("要复用已有的 Claude Code 配置目录吗？直接回车=新建专用目录（推荐）", "")
+        cmd_add(argparse.Namespace(name=name, label=label, cli_dir=reuse or None), cfg)
+        a = get_account(cfg, name)
+        if not read_creds(a["cli_dir"])[0]:
+            while not cli_login(cfg, a):
+                if ask("重试登录？(y/n)", "y") != "y":
+                    break
+        print()
+
+    st = load_state()
+    for a in cfg["accounts"]:
+        if has_profile(a["name"]):
+            continue
+        uid = desktop_account_uuid()
+        if uid and uid == a.get("account_uuid"):
+            print(f"检测到桌面版当前登录的就是【{a['name']}】，保存它的登录（Claude 会重启一下）…")
+            cmd_capture(argparse.Namespace(name=a["name"], force=False, detached=False), cfg)
+            continue
+        print(f"\n接下来在桌面版登录【{a['name']}】（{a.get('email')}）。")
+        cur = current_desktop_profile(cfg, st)
+        if uid and not cur:
+            print("桌面版当前登录的账号不属于这两个号。")
+            if ask("把桌面版当前登录先备份起来再继续？(y/n)", "y") != "y":
+                die("已取消")
+            backup_desktop("foreign-login")
+        input("按回车：Claude 会以未登录状态重新打开 …")
+        cmd_desktop_login(argparse.Namespace(name=a["name"]), cfg) if (cur or not uid) else _foreign_login_reset(cfg)
+        while True:
+            input(f"在 Claude 里登录好【{a['name']}】后按回车 …")
+            uid2 = desktop_account_uuid()
+            if uid2 and (not a.get("account_uuid") or uid2 == a["account_uuid"]):
+                break
+            print("还没检测到这个账号的登录（如果刚登录，等几秒再按回车）。")
+        cmd_capture(argparse.Namespace(name=a["name"], force=False, detached=False), cfg)
+
+    print()
+    if ask("安装后台调度（每 5 分钟查额度、按 2.5h 错峰自动预热）和菜单栏？(y/n)", "y") == "y":
+        install_agents()
+    print(f"\n{C['g']}全部完成！{C['r']} 常用命令：cduo（看状态） · cduo switch（切号） · cduo doctor（自检）")
+    cmd_status(argparse.Namespace(json=False, cached=False), cfg)
+
+
+def _foreign_login_reset(cfg):
+    def run():
+        clear_desktop_login()
+    _with_app_closed(cfg, run, "foreign-reset")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="cduo", description="两个 Claude 账号：桌面版一键切换 + 5h 窗口错峰预热")
+    ap.add_argument("--version", action="version", version=VERSION)
+    sub = ap.add_subparsers(dest="cmd")
+    p = sub.add_parser("status", help="看两个号的额度和建议（默认命令）")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--cached", action="store_true", help="只读上次的状态，不联网")
+    p = sub.add_parser("switch", help="切换桌面版账号（不填名字=按规则自动选）")
+    p.add_argument("name", nargs="?")
+    p.add_argument("--after-turn", action="store_true", help="等当前回复结束再切")
+    p.add_argument("--no-relaunch", action="store_true")
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--detached", action="store_true", help=argparse.SUPPRESS)
+    sub.add_parser("setup", help="设置向导")
+    p = sub.add_parser("add", help="添加账号")
+    p.add_argument("name")
+    p.add_argument("--label")
+    p.add_argument("--cli-dir", help="复用已有的 Claude Code 配置目录")
+    p = sub.add_parser("login", help="给账号做 CLI 登录（查额度/预热用）")
+    p.add_argument("name")
+    p = sub.add_parser("capture", help="把桌面版当前登录保存为该账号的快照")
+    p.add_argument("name")
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--detached", action="store_true", help=argparse.SUPPRESS)
+    p = sub.add_parser("desktop-login", help="存好当前登录后，让桌面版以未登录状态打开（用来登录新账号）")
+    p.add_argument("name")
+    p = sub.add_parser("ping", help="立刻预热（启动该账号的 5h 窗口）")
+    p.add_argument("name")
+    p = sub.add_parser("sync", help="同步桌面版各账号的会话列表")
+    p.add_argument("--dry-run", action="store_true")
+    p = sub.add_parser("tick", help="后台调度跑一轮（launchd 每 5 分钟调用）")
+    p.add_argument("-v", "--verbose", action="store_true")
+    p = sub.add_parser("config", help="查看/修改：auto_switch off|notify|idle · switch_threshold 95 · work_hours 10:00-01:00 · prewarm_enabled on|off")
+    p.add_argument("key", nargs="?")
+    p.add_argument("value", nargs="?")
+    sub.add_parser("pin-org", help="记住并固定桌面版的主组织（如 Premium Seat）")
+    p = sub.add_parser("rename", help="改账号的显示名（菜单栏/通知里显示）")
+    p.add_argument("name")
+    p.add_argument("label")
+    p = sub.add_parser("agents", help="后台调度和菜单栏：install / uninstall / status / login-on / login-off")
+    p.add_argument("action", choices=["install", "uninstall", "status", "login-on", "login-off"])
+    p.add_argument("--no-menubar", action="store_true")
+    sub.add_parser("doctor", help="自检")
+    args = ap.parse_args()
+    cfg = load_config()
+    if not cfg.get("claude_bin") or not pathlib.Path(cfg["claude_bin"]).exists():
+        cfg["claude_bin"] = find_claude_bin()
+        if cfg["claude_bin"] and CONFIG.exists():
+            save_config(cfg)
+    cmds = {"status": cmd_status, "switch": cmd_switch, "setup": cmd_setup, "add": cmd_add, "login": cmd_login,
+            "capture": cmd_capture, "desktop-login": cmd_desktop_login, "ping": cmd_ping, "sync": cmd_sync,
+            "tick": cmd_tick, "config": cmd_config, "agents": cmd_agents, "doctor": cmd_doctor,
+            "rename": cmd_rename, "pin-org": cmd_pin_org}
+    if not args.cmd:
+        args = ap.parse_args(["status"])
+    try:
+        cmds[args.cmd](args, cfg)
+    except KeyboardInterrupt:
+        print("\n已取消")
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()
