@@ -705,12 +705,131 @@ func renderPNG<V: View>(_ view: V, _ path: String, dark: Bool) {
     }
 }
 
+// MARK: - 弹出面板：菜单栏下方留出间距的浮动窗口（不带箭头，类似控制中心）
+
+let panelGap: CGFloat = 10        // 面板顶部离菜单栏的距离
+let panelRadius: CGFloat = 14
+
+final class FloatingPanel: NSPanel {
+    init() {
+        super.init(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        isFloatingPanel = true
+        level = .statusBar
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = true
+        hidesOnDeactivate = false
+        isMovable = false
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+    }
+    override var canBecomeKey: Bool { true }     // 设置页里的输入框要能打字
+}
+
+final class PanelController: NSObject, NSWindowDelegate {
+    let panel = FloatingPanel()
+    let hosting: NSHostingController<RootView>
+    weak var anchor: NSStatusBarButton?
+    var monitors: [Any] = []
+    var sizeObs: NSKeyValueObservation?
+    var isShown: Bool { panel.isVisible }
+
+    init(model: Model) {
+        hosting = NSHostingController(rootView: RootView(m: model))
+        super.init()
+        if #available(macOS 13.0, *) { hosting.sizingOptions = [.preferredContentSize] }
+        let bg = NSVisualEffectView()
+        bg.material = .popover
+        bg.blendingMode = .behindWindow
+        bg.state = .active
+        bg.wantsLayer = true
+        bg.layer?.cornerRadius = panelRadius
+        bg.layer?.cornerCurve = .continuous
+        bg.layer?.masksToBounds = true
+        bg.layer?.borderWidth = 0.5
+        bg.layer?.borderColor = NSColor.separatorColor.cgColor
+        hosting.view.translatesAutoresizingMaskIntoConstraints = false
+        bg.addSubview(hosting.view)
+        NSLayoutConstraint.activate([
+            hosting.view.leadingAnchor.constraint(equalTo: bg.leadingAnchor),
+            hosting.view.trailingAnchor.constraint(equalTo: bg.trailingAnchor),
+            hosting.view.topAnchor.constraint(equalTo: bg.topAnchor),
+            hosting.view.bottomAnchor.constraint(equalTo: bg.bottomAnchor),
+        ])
+        panel.contentView = bg
+        panel.delegate = self
+        // 主页 ↔ 设置页高度不同：内容变了就跟着改大小，顶部位置不动
+        sizeObs = hosting.observe(\.preferredContentSize, options: [.new]) { [weak self] _, _ in
+            DispatchQueue.main.async { if self?.isShown == true { self?.layout(animate: true) } }
+        }
+    }
+
+    func contentSize() -> NSSize {
+        let s = hosting.preferredContentSize
+        return s.width > 10 && s.height > 10 ? s : hosting.view.fittingSize
+    }
+
+    func targetFrame() -> NSRect? {
+        guard let b = anchor, let w = b.window else { return nil }
+        let r = w.convertToScreen(b.convert(b.bounds, to: nil))
+        let size = contentSize()
+        let vis = (w.screen ?? NSScreen.main)?.visibleFrame ?? .zero
+        let top = min(r.minY, vis.maxY) - panelGap
+        var x = r.midX - size.width / 2
+        x = max(vis.minX + 8, min(x, vis.maxX - size.width - 8))
+        return NSRect(x: x, y: top - size.height, width: size.width, height: size.height)
+    }
+
+    func layout(animate: Bool) {
+        guard let f = targetFrame() else { return }
+        panel.setFrame(f, display: true, animate: animate && panel.frame.height > 0)
+        panel.invalidateShadow()
+    }
+
+    func show(from button: NSStatusBarButton) {
+        anchor = button
+        hosting.view.layoutSubtreeIfNeeded()
+        guard let f = targetFrame() else { return }
+        panel.setFrame(f.offsetBy(dx: 0, dy: 6), display: false)
+        panel.alphaValue = 0
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.16
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            panel.animator().alphaValue = 1
+            panel.animator().setFrame(f, display: true)
+        }
+        panel.invalidateShadow()
+        // 点面板外面、按 Esc 就收起
+        monitors.append(NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in self?.close() } as Any)
+        monitors.append(NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] e in
+            if e.keyCode == 53 { self?.close(); return nil }
+            return e
+        } as Any)
+    }
+
+    func close() {
+        guard isShown else { return }
+        monitors.forEach { NSEvent.removeMonitor($0) }
+        monitors.removeAll()
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.12
+            panel.animator().alphaValue = 0
+        }, completionHandler: { [weak self] in
+            self?.panel.orderOut(nil)
+            self?.panel.alphaValue = 1
+        })
+    }
+
+    func windowDidResignKey(_ notification: Notification) { close() }
+}
+
 // MARK: - App
 
 class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     var item: NSStatusItem!
     let model = Model()
-    let popover = NSPopover()
+    var panel: PanelController!
     var timer: Timer?, queueTimer: Timer?
     var notifAuthorized = false
     var bag: Any?
@@ -725,9 +844,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         item.button?.imagePosition = .imageLeft
         item.button?.target = self
         item.button?.action = #selector(togglePopover)
-        popover.behavior = .transient
-        popover.animates = true
-        popover.contentViewController = NSHostingController(rootView: RootView(m: model))
+        item.button?.sendAction(on: [.leftMouseDown, .rightMouseDown])
+        panel = PanelController(model: model)
+        // 让命令行也能打开面板（自检 / 截图用）
+        DistributedNotificationCenter.default().addObserver(forName: Notification.Name("com.cduo.togglePanel"), object: nil, queue: .main) { [weak self] _ in
+            self?.togglePopover()
+        }
         model.onSwitchError = { [weak self] msg in self?.post(title: "切换没有完成", body: msg, kind: "info", target: nil) }
         bag = model.objectWillChange.sink { [weak self] _ in DispatchQueue.main.async { self?.updateButton() } }
         setupNotifications()
@@ -750,11 +872,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     }
 
     @objc func togglePopover() {
-        if popover.isShown { popover.performClose(nil); return }
+        if panel.isShown { panel.close(); return }
         model.showSettings = false; model.confirmFor = nil
         model.refresh(network: false)
-        NSApp.activate(ignoringOtherApps: true)
-        popover.show(relativeTo: item.button!.bounds, of: item.button!, preferredEdge: .minY)
+        panel.show(from: item.button!)
     }
 
     func updateButton() {
