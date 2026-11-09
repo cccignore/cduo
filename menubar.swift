@@ -48,12 +48,15 @@ func runCduoSync(_ args: [String]) -> (String, Int32) {
     return (String(data: data, encoding: .utf8) ?? "", p.terminationStatus)
 }
 
-func openInTerminal(_ cmd: String) {
+/// 在「终端」App 里跑 cduo 子命令。用完整路径，不依赖 PATH 里有没有 ~/.local/bin。
+func openInTerminal(_ sub: String) {
     let path = cduoDir + "/run.command"
-    let script = "#!/bin/zsh -l\nclear\n\(cmd)\necho\nread -k1 \"?完成。按任意键关闭此窗口…\"\n"
+    let q = { (s: String) in "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+    let script = "#!/bin/zsh -l\nclear\n/usr/bin/python3 \(q(cduoBin)) \(sub)\necho\nread -k1 \"?完成。按任意键关闭此窗口…\"\n"
     try? script.write(toFile: path, atomically: true, encoding: .utf8)
     chmod(path, 0o755)
-    NSWorkspace.shared.open(URL(fileURLWithPath: path))
+    NSWorkspace.shared.open([URL(fileURLWithPath: path)], withApplicationAt: URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app"),
+                            configuration: NSWorkspace.OpenConfiguration())
 }
 
 func requestAccessibility() {
@@ -316,7 +319,7 @@ struct AccountCard: View {
 
     @ViewBuilder var action: some View {
         if a.util == nil {
-            Button("重新登录") { openInTerminal("cduo login \(a.name)") }
+            Button("重新登录") { openInTerminal("login \(a.name)") }
                 .buttonStyle(.bordered).controlSize(.small)
         } else if a.current {
             Text(m.mode == "idle" ? "用完自动换走" : "正在使用")
@@ -479,7 +482,7 @@ struct MainView: View {
             Text("还没有添加账号").font(.system(size: 14, weight: .semibold))
             Text("设置向导会带你登录两个号，大约 5 分钟。过程中 Claude 会重启几次。")
                 .font(.system(size: 12)).foregroundColor(.secondary).multilineTextAlignment(.center)
-            Button { openInTerminal("cduo setup") } label: { Text("开始设置").frame(maxWidth: .infinity) }
+            Button { openInTerminal("setup") } label: { Text("开始设置").frame(maxWidth: .infinity) }
                 .buttonStyle(.borderedProminent).controlSize(.large)
         }
         .padding(.vertical, 10)
@@ -575,8 +578,8 @@ struct SettingsView: View {
                         }
                         HStack(spacing: 8) {
                             tool("同步会话", "arrow.triangle.2.circlepath") { runCduo(["sync"]) }
-                            tool("自检", "stethoscope") { openInTerminal("cduo doctor") }
-                            tool("设置向导", "wand.and.stars") { openInTerminal("cduo setup") }
+                            tool("自检", "stethoscope") { openInTerminal("doctor") }
+                            tool("设置向导", "wand.and.stars") { openInTerminal("setup") }
                             tool("日志", "doc.text") { NSWorkspace.shared.open(URL(fileURLWithPath: cduoDir + "/logs/cduo.log")) }
                         }
                     }

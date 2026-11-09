@@ -27,6 +27,14 @@ rm -rf "$DEST/Cduo.app"
 ditto "$BUILD/Cduo.app" "$DEST/Cduo.app"
 install -m 755 "$SRC/cduo" "$CORE_DIR/cduo"
 ln -sf "$CORE_DIR/cduo" "$HOME/.local/bin/cduo"
+# 让「终端」里能直接敲 cduo：~/.local/bin 不在 PATH 里就加到 ~/.zprofile
+case ":$PATH:" in
+  *":$HOME/.local/bin:"*) ;;
+  *) if ! grep -qs '.local/bin' "$HOME/.zprofile"; then
+       printf '\n# cduo\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$HOME/.zprofile"
+       echo "✓ 已把 ~/.local/bin 加入 PATH（新开的终端窗口生效）"
+     fi ;;
+esac
 rm -f "$CORE_DIR/cduo-menubar" "$CORE_DIR/menubar.swift"   # v0.1 的旧菜单栏
 
 mkdir -p "$HOME/.claude/skills/cduo"

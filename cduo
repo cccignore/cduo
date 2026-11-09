@@ -29,7 +29,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 HOME = pathlib.Path.home()
 CDUO = pathlib.Path(os.environ.get("CDUO_HOME", str(HOME / ".cduo")))
 CONFIG = CDUO / "config.json"
@@ -184,8 +184,57 @@ def notify(msg: str, title: str = "Cduo", kind: str = "info", target: str | None
 
 
 def in_desktop_app() -> bool:
+    """看环境变量：是不是从 Claude 桌面版里（对话或终端面板）启动的。"""
     return (os.environ.get("CLAUDE_CODE_ENTRYPOINT") == "claude-desktop"
             or os.environ.get("__CFBundleIdentifier") == BUNDLE_ID)
+
+
+def under_claude_process() -> bool:
+    """当前进程是不是 Claude 桌面版的子进程。是的话，Claude 一退出这里也会被杀掉。
+
+    只看环境变量会误判（变量可能被别的终端继承），所以沿父进程链往上找 Claude.app。
+    """
+    if FAKE_DESKTOP:
+        return False
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,ppid=,comm="], capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return in_desktop_app()
+    procs = {}
+    for line in out.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+            procs[int(parts[0])] = (int(parts[1]), parts[2])
+    pid, seen = os.getpid(), set()
+    while pid in procs and pid > 1 and pid not in seen:
+        seen.add(pid)
+        ppid, comm = procs[pid]
+        if "/Claude.app/Contents/" in comm:      # 桌面版主程序或它的 Helper（区分大小写，不含自带的 claude.app）
+            return True
+        pid = ppid
+    return False
+
+
+def open_in_terminal(argv: list) -> bool:
+    """在 macOS 自带的「终端」App 里新开一个窗口运行 cduo 命令。"""
+    import shlex
+    script = CDUO / "run.command"
+    CDUO.mkdir(parents=True, exist_ok=True)
+    cmd = " ".join(shlex.quote(x) for x in [sys.executable, os.path.abspath(__file__)] + argv)
+    script.write_text(f"#!/bin/zsh -l\nclear\n{cmd}\necho\nread -k1 \"?完成。按任意键关闭此窗口…\"\n", encoding="utf-8")
+    os.chmod(script, 0o755)
+    return subprocess.run(["open", "-a", "Terminal", str(script)], capture_output=True).returncode == 0
+
+
+def need_real_terminal(argv: list, what: str) -> None:
+    """这个命令会关掉 Claude；如果正跑在 Claude 里，就换到「终端」App 里去跑。"""
+    if not under_claude_process():
+        return
+    if open_in_terminal(argv):
+        print(f"{what}过程中要重启 Claude，不能在 Claude 里面运行。\n"
+              f"已经在 macOS 的「终端」App 里打开了 cduo {' '.join(argv)}，请切到那个窗口继续。")
+        sys.exit(0)
+    die(f"{what}过程中要重启 Claude，请打开 macOS 自带的「终端」App（启动台 → 其他 → 终端）运行：cduo {' '.join(argv)}")
 
 
 # ───────────────────────── 配置 / 状态 ─────────────────────────
@@ -1495,7 +1544,7 @@ def cmd_switch(args, cfg):
             if not others:
                 die("没有可切换的另一个账号（需要先保存桌面登录快照）")
             target = others[0]
-    if in_desktop_app() and not args.detached:
+    if (in_desktop_app() or under_claude_process()) and not args.detached:
         spawn_detached(["switch", target, "--after-turn", "--detached"] + (["--force"] if args.force else []))
         print(f"好的：等这一轮回复结束后（约十几秒），Claude 会自动重启并切到 {target}。"
               f"重启后点开原来的会话就能接着聊。")
@@ -1516,7 +1565,7 @@ def _with_app_closed(cfg, fn, tag: str):
 
 def cmd_capture(args, cfg):
     a = get_account(cfg, args.name)
-    if in_desktop_app() and not args.detached:
+    if (in_desktop_app() or under_claude_process()) and not args.detached:
         spawn_detached(["capture", args.name, "--detached"] + (["--force"] if args.force else []))
         print("好的：这一轮结束后 Claude 会重启一下，用来保存当前登录。")
         return
@@ -1543,8 +1592,7 @@ def cmd_capture(args, cfg):
 def cmd_desktop_login(args, cfg):
     """为新账号准备：存好当前登录后，让桌面版以'未登录'状态打开。"""
     get_account(cfg, args.name)
-    if in_desktop_app():
-        die("这个命令会关掉 Claude 桌面版，请在 macOS 自带的「终端」App（Terminal.app）里运行")
+    need_real_terminal(["desktop-login", args.name], "登录新账号")
     st = load_state()
     cur = current_desktop_profile(cfg, st)
     if desktop_account_uuid() and not cur:
@@ -1802,8 +1850,7 @@ def ask(prompt: str, default: str = "") -> str:
 
 
 def cmd_setup(args, cfg):
-    if in_desktop_app():
-        die("setup 过程中需要重启 Claude 桌面版，请在 macOS 自带的「终端」App（Terminal.app，不是 Claude 里的终端面板）运行：cduo setup")
+    need_real_terminal(["setup"], "设置")
     print(f"{C['b']}cduo 设置向导{C['r']}（随时 Ctrl-C 退出，重新运行会接着来）\n")
     if not cfg.get("claude_bin"):
         cfg["claude_bin"] = find_claude_bin()
