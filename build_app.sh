@@ -32,6 +32,11 @@ trap 'rm -rf "$TMP"' EXIT
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
+# 用和编译器配套的 SDK。环境里的 SDKROOT 可能指向另一套（常见：xcode-select 指向 Xcode，
+# SDKROOT 却是命令行工具的 SDK），两边不配套时 SwiftUI 的 @State 宏插件找不到，编译直接失败。
+SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+export SDKROOT
+
 echo "→ 编译 Cduo（约半分钟）…"
 ARCH="$(uname -m)"
 xcrun swiftc -O -target "$ARCH-apple-macos13.0" "$SRC/menubar.swift" -o "$APP/Contents/MacOS/Cduo"
