@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""cduo — 两个 Claude 账号：桌面版一键切换（对话不丢）+ 5h 窗口错峰预热。
+"""cduo — 多个 Claude 账号（两个或更多）：桌面版一键切换（对话不丢）+ 5h 窗口错峰预热。
 
 只用 Python 3.9 标准库。数据都在 ~/.cduo/ 下：
   config.json   账号与偏好
@@ -1279,6 +1279,11 @@ def prewarm_accounts(cfg: dict) -> list:
     return [a for a in cfg["accounts"] if a.get("prewarm", True)]
 
 
+def accounts_text(n: int) -> str:
+    """说"全部账号"时用：两个号就说"两个号"，更多就说"3 个号"。"""
+    return "两个号" if n == 2 else f"{n} 个号"
+
+
 def lbl(cfg: dict, name) -> str:
     """显示名：优先用备注。"""
     if not name:
@@ -1290,7 +1295,7 @@ def lbl(cfg: dict, name) -> str:
 def plan_pings(cfg: dict, st: dict):
     """返回 (要立刻预热的账号, 说明, 下一次预计预热时间)。
 
-    规则：n 个账号的重置时刻在 5h 内均匀错开（2 个号=相隔 2.5h）。
+    规则：n 个账号的重置时刻在 5h 内均匀错开（2 个号=相隔 2.5h，3 个号=相隔 1h40m，以此类推）。
     - 都没在计时：先启动桌面版当前在用的那个；
     - 有在计时的：当最近启动的那个窗口已经跑了 5h/n，就启动下一个空闲账号。
     """
@@ -1303,7 +1308,7 @@ def plan_pings(cfg: dict, st: dict):
     running = [a for a in accts if rs[a["name"]]]
     idle = [a for a in accts if not rs[a["name"]]]
     if not idle:
-        return None, "两个号都在计时，刷新时间已错开", None
+        return None, f"{accounts_text(n)}都在计时，刷新时间已错开", None
     cur = st.get("desktop_current")
     idle.sort(key=lambda a: (0 if a["name"] == cur else 1, accts.index(a)))
     first = lbl(cfg, idle[0]["name"])
@@ -1312,7 +1317,7 @@ def plan_pings(cfg: dict, st: dict):
     latest = max(rs[a["name"]] for a in running)
     due = latest - (WINDOW - gap)
     if now() >= due:
-        return idle[0], f"现在让 {first} 开始计时（与另一个号错开 {dur(gap)}）", due
+        return idle[0], f"现在让 {first} 开始计时（与上一个号错开 {dur(gap)}）", due
     return None, f"{first} 将在 {hhmm(due)} 自动开始计时（错开 {dur(gap)}）", due
 
 
@@ -1339,7 +1344,8 @@ def recommend(cfg: dict, st: dict) -> dict:
                         "reason": f"{lbl(cfg, a['name'])} 还有额度，但还没在桌面版登录过。"
                                   f"点它卡片上的「登录桌面版」，登录一次以后就能一键切换"}
         soon = min((i["resets"] for i in info.values() if i["resets"]), default=None)
-        return {"action": "wait", "target": None, "reason": f"两个号都快用完了，{hhmm(soon)} 恢复"}
+        return {"action": "wait", "target": None,
+                "reason": f"{accounts_text(len(cfg['accounts']))}都快用完了，{hhmm(soon)} 恢复"}
     rank = sorted(usable, key=lambda n: (0 if info[n]["running"] else 1, info[n]["resets"] or 9e12,
                                          0 if n == cur else 1))
     best = rank[0]
@@ -1488,7 +1494,7 @@ def tick(cfg: dict, verbose: bool = False, allow_ping: bool = True) -> dict:
                     st["resume_wait"] = {"until": soon, "count": len(inter)}
                     if st.get("last_notified") != f"wait:{soon}":
                         notify((f"{hhmm(soon)} 有号刷新后，会自动换过去" + ("并续上被打断的任务" if inter else ""))
-                               if soon else "等额度刷新后再继续", "两个号都用完了")
+                               if soon else "等额度刷新后再继续", f"{accounts_text(len(cfg['accounts']))}都用完了")
                         st["last_notified"] = f"wait:{soon}"
         if not (mode == "idle" and exhausted and not plan):
             st.pop("resume_wait", None)
@@ -2035,7 +2041,8 @@ def cmd_switch(args, cfg):
             others = [a["name"] for a in cfg["accounts"] if a["name"] != cur and has_profile(a["name"])]
             if not others:
                 die("没有可切换的另一个账号（需要先保存桌面登录快照）")
-            target = others[0]
+            # 号多的时候"另一个号"不止一个：和自动换号同一个规则，挑还有余量、最早刷新的那个
+            target = pick_target(cfg, st, exclude=cur) or others[0]
     if (in_desktop_app() or under_claude_process()) and not args.detached:
         spawn_detached(["switch", target, "--after-turn", "--detached"] + (["--force"] if args.force else []))
         print(f"好的：等这一轮回复结束后（约十几秒），Claude 会自动重启并切到 {target}。"
@@ -2274,6 +2281,38 @@ def cmd_pin_org(args, cfg):
     print(f"✓ 已固定：以后换号都会进入「{a.get('org_name')}」")
 
 
+def cmd_remove(args, cfg):
+    """不再让 cduo 管理某个号。
+
+    它的桌面版登录快照挪进备份目录；CLI 登录目录原样保留，以后用 cduo add 加回来不用重新授权。
+    """
+    a = get_account(cfg, args.name)
+    if current_desktop_profile(cfg, load_state()) == a["name"] and not args.force:
+        die(f"Claude 桌面版现在登录的就是 {args.name}。先切到别的号再移除（确定要移除就加 --force）")
+    cfg["accounts"] = [x for x in cfg["accounts"] if x["name"] != a["name"]]
+    save_config(cfg)
+
+    def drop(st):
+        st["accounts"].pop(a["name"], None)
+        if st.get("desktop_current") == a["name"]:
+            st.pop("desktop_current", None)
+        if (st.get("recommend") or {}).get("target") == a["name"]:
+            st.pop("recommend", None)
+    update_state(drop)
+    moved = None
+    d = profile_dir(a["name"])
+    if d.exists():
+        moved = BACKUP / f"{dt.datetime.now():%Y%m%d-%H%M%S}-removed-{a['name']}"
+        moved.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(d), str(moved))
+    log(f"removed account {a['name']}" + (f" (desktop snapshot moved to {moved.name})" if moved else ""))
+    print(f"{C['g']}✓ 已移除 {args.name}{C['r']}" + (f"（桌面版登录快照挪到了 {moved}）" if moved else ""))
+    if a.get("owned"):
+        print(f"  它的 CLI 登录还留在 {a['cli_dir']}，以后 cduo add {args.name} 加回来不用重新授权。")
+    if len(cfg["accounts"]) < 2:
+        print(f"{C['y']}! 现在只剩 {len(cfg['accounts'])} 个号了，换号、错峰都需要至少两个：cduo setup --add{C['r']}")
+
+
 def cmd_rename(args, cfg):
     a = get_account(cfg, args.name)
     a["label"] = args.label.strip()[:12] or a["name"]
@@ -2405,44 +2444,71 @@ def ask(prompt: str, default: str = "") -> str:
     return s or default
 
 
+def _setup_add_account(cfg: dict) -> dict:
+    """设置向导里加一个号：起名 → 在浏览器里给 CLI 授权（查额度、预热用）。"""
+    print(f"{C['b']}— 第 {len(cfg['accounts']) + 1} 个账号 —{C['r']}")
+    while True:   # 名字不合规或重名就重问，别让整个向导直接退出
+        name = ask("给它起个短名字（字母/数字，如 neu、me）")
+        if not re.match(r"^[A-Za-z0-9_-]{1,16}$", name):
+            print("名字只能用字母、数字、- 和 _，最长 16 个字符。")
+        elif any(a["name"] == name for a in cfg["accounts"]):
+            print(f"已经有一个叫 {name} 的号了，换个名字。")
+        else:
+            break
+    label = ask("备注（可选）", name)
+    reuse = ask("要复用已有的 Claude Code 配置目录吗？直接回车=新建专用目录（推荐）", "")
+    cmd_add(argparse.Namespace(name=name, label=label, cli_dir=reuse or None), cfg)
+    a = get_account(cfg, name)
+    if not read_creds(a["cli_dir"])[0]:
+        while not cli_login(cfg, a):
+            if ask("重试登录？(y/n)", "y") != "y":
+                break
+    twin = next((x for x in cfg["accounts"] if x is not a and x.get("account_uuid")
+                 and x.get("account_uuid") == a.get("account_uuid") and x.get("org_uuid") == a.get("org_uuid")), None)
+    if twin:
+        print(f"{C['y']}! 这个号和【{twin['name']}】是同一个账号、同一个组织，额度是共用的，加两次没有用。"
+              f"可以用 cduo remove {name} 去掉它。{C['r']}")
+    print()
+    return a
+
+
 def cmd_setup(args, cfg):
-    need_real_terminal(["setup"], "设置")
-    print(f"{C['b']}cduo 设置向导{C['r']}（随时 Ctrl-C 退出，重新运行会接着来）\n")
+    want_add = bool(getattr(args, "add", False))
+    adding = want_add and len(cfg["accounts"]) >= 2      # 已经设置过：只再加一个号，不再问作息时间
+    need_real_terminal(["setup"] + (["--add"] if want_add else []), "设置")
+    print(f"{C['b']}cduo：再加一个号{C['r']}（随时 Ctrl-C 退出）\n" if adding else
+          f"{C['b']}cduo 设置向导{C['r']}（随时 Ctrl-C 退出，重新运行会接着来）\n")
     if not cfg.get("claude_bin"):
         cfg["claude_bin"] = find_claude_bin()
     print(f"claude 命令: {cfg.get('claude_bin') or '没找到'}")
     if not cfg.get("claude_bin"):
         cfg["claude_bin"] = ask("请输入 claude 可执行文件的完整路径")
     print(f"代理: {proxy_url(cfg) or '不使用'}（跟随系统设置）\n")
-    def norm(t):
-        t = t.replace("：", ":").strip()
-        if ":" not in t:
-            t += ":00"
-        hh, mm = map(int, t.split(":"))
-        return f"{hh % 24:02d}:{mm:02d}"
-    wh = cfg.get("work_hours") or {}
-    ws = norm(ask("你一般几点开始用 Claude？(HH:MM)", wh.get("start", "10:00")))
-    we = norm(ask("一般几点收工？(HH:MM)", wh.get("end", "01:00")))
-    h, m = map(int, ws.split(":"))
-    start = f"{(h - 4) % 24:02d}:{m:02d}"
-    cfg["active_hours"] = {"start": start, "end": we}
-    cfg["work_hours"] = {"start": ws, "end": we}
-    print(f"→ 自动预热时段设为 {start}–{we}（开工前约 4 小时预热第一个号，开工后约 1 小时就会有一次额度刷新）\n")
+    if not adding:
+        def norm(t):
+            t = t.replace("：", ":").strip()
+            if ":" not in t:
+                t += ":00"
+            hh, mm = map(int, t.split(":"))
+            return f"{hh % 24:02d}:{mm:02d}"
+        wh = cfg.get("work_hours") or {}
+        ws = norm(ask("你一般几点开始用 Claude？(HH:MM)", wh.get("start", "10:00")))
+        we = norm(ask("一般几点收工？(HH:MM)", wh.get("end", "01:00")))
+        h, m = map(int, ws.split(":"))
+        start = f"{(h - 4) % 24:02d}:{m:02d}"
+        cfg["active_hours"] = {"start": start, "end": we}
+        cfg["work_hours"] = {"start": ws, "end": we}
+        print(f"→ 自动预热时段设为 {start}–{we}（开工前约 4 小时预热第一个号，开工后约 1 小时就会有一次额度刷新）\n")
     save_config(cfg)
 
-    while len(cfg["accounts"]) < 2:
-        i = len(cfg["accounts"]) + 1
-        print(f"{C['b']}— 第 {i} 个账号 —{C['r']}")
-        name = ask("给它起个短名字（字母/数字，如 neu、me）")
-        label = ask("备注（可选）", name)
-        reuse = ask("要复用已有的 Claude Code 配置目录吗？直接回车=新建专用目录（推荐）", "")
-        cmd_add(argparse.Namespace(name=name, label=label, cli_dir=reuse or None), cfg)
-        a = get_account(cfg, name)
-        if not read_creds(a["cli_dir"])[0]:
-            while not cli_login(cfg, a):
-                if ask("重试登录？(y/n)", "y") != "y":
-                    break
-        print()
+    while len(cfg["accounts"]) < 2:      # 至少两个号
+        _setup_add_account(cfg)
+    if adding:
+        _setup_add_account(cfg)
+    else:
+        while ask(f"现在有 {len(cfg['accounts'])} 个号。还要再加一个吗？号越多，刷新时间错得越密 (y/n)",
+                  "n").strip().lower() == "y":
+            _setup_add_account(cfg)
 
     st = load_state()
     for a in cfg["accounts"]:
@@ -2451,7 +2517,11 @@ def cmd_setup(args, cfg):
         desktop_login_flow(cfg, a, st)
 
     print()
-    if ask("安装后台调度（每 5 分钟查额度、按 2.5h 错峰自动预热）和菜单栏？(y/n)", "y") == "y":
+    gap = dur(WINDOW / max(1, len(prewarm_accounts(cfg))))
+    if adding and agent_path(AGENT_TICK).exists():
+        print(f"后台调度已经在跑，新加的号 5 分钟内就会算进去（{accounts_text(len(cfg['accounts']))}按 {gap} 错峰）。")
+    elif ask(f"安装后台调度（每 5 分钟查额度、{accounts_text(len(cfg['accounts']))}按 {gap} 错峰自动预热）和菜单栏？(y/n)",
+             "y") == "y":
         install_agents()
     print(f"\n{C['g']}全部完成！{C['r']} 常用命令：cduo（看状态） · cduo switch（切号） · cduo doctor（自检）")
     cmd_status(argparse.Namespace(json=False, cached=False), cfg)
@@ -2501,10 +2571,10 @@ def _foreign_login_reset(cfg):
 
 
 def main():
-    ap = argparse.ArgumentParser(prog="cduo", description="两个 Claude 账号：桌面版一键切换 + 5h 窗口错峰预热")
+    ap = argparse.ArgumentParser(prog="cduo", description="多个 Claude 账号：桌面版一键切换 + 5h 窗口错峰预热")
     ap.add_argument("--version", action="version", version=VERSION)
     sub = ap.add_subparsers(dest="cmd")
-    p = sub.add_parser("status", help="看两个号的额度和建议（默认命令）")
+    p = sub.add_parser("status", help="看各个号的额度和建议（默认命令）")
     p.add_argument("--json", action="store_true")
     p.add_argument("--cached", action="store_true", help="只读上次的状态，不联网")
     p = sub.add_parser("switch", help="切换桌面版账号（不填名字=按规则自动选）")
@@ -2513,8 +2583,9 @@ def main():
     p.add_argument("--no-relaunch", action="store_true")
     p.add_argument("--force", action="store_true")
     p.add_argument("--detached", action="store_true", help=argparse.SUPPRESS)
-    sub.add_parser("setup", help="设置向导")
-    p = sub.add_parser("add", help="添加账号")
+    p = sub.add_parser("setup", help="设置向导（--add：已经设置过，只再加一个号）")
+    p.add_argument("--add", action="store_true", help="只再加一个号，不重新问作息时间")
+    p = sub.add_parser("add", help="添加账号（只写配置；一般用 cduo setup --add，会一并登录）")
     p.add_argument("name")
     p.add_argument("--label")
     p.add_argument("--cli-dir", help="复用已有的 Claude Code 配置目录")
@@ -2544,6 +2615,9 @@ def main():
     p = sub.add_parser("rename", help="改账号的显示名（菜单栏/通知里显示）")
     p.add_argument("name")
     p.add_argument("label")
+    p = sub.add_parser("remove", help="不再管理某个号（桌面版登录快照挪进备份，CLI 登录保留）")
+    p.add_argument("name")
+    p.add_argument("--force", action="store_true", help="桌面版当前登录的就是它也照样移除")
     p = sub.add_parser("agents", help="后台调度和菜单栏：install / uninstall / status / login-on / login-off")
     p.add_argument("action", choices=["install", "uninstall", "status", "login-on", "login-off"])
     p.add_argument("--no-menubar", action="store_true")
@@ -2565,7 +2639,7 @@ def main():
             "capture": cmd_capture, "desktop-login": cmd_desktop_login, "ping": cmd_ping, "sync": cmd_sync,
             "tick": cmd_tick, "config": cmd_config, "agents": cmd_agents, "doctor": cmd_doctor,
             "rename": cmd_rename, "pin-org": cmd_pin_org, "resume": cmd_resume, "login-desktop": cmd_login_desktop,
-            "restore": cmd_restore}
+            "restore": cmd_restore, "remove": cmd_remove}
     if not args.cmd:
         args = ap.parse_args(["status"])
     try:
