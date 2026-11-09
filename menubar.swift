@@ -286,10 +286,11 @@ struct Pill: View {
 struct AccountCard: View {
     @ObservedObject var m: Model
     let a: Acct
-    var recommended: Bool { m.recAction == "switch" && m.recTarget == a.name }
+    var recommended: Bool { (m.recAction == "switch" || m.recAction == "need_login") && m.recTarget == a.name }
 
     var subtitle: String {
         if a.util == nil { return "额度读取失败" }
+        if !a.hasProfile && !a.current { return "还没在桌面版登录" }
         return a.running ? "\(hhmm(a.resetsAt)) 刷新" : "满额 · 未开始计时"
     }
 
@@ -302,7 +303,7 @@ struct AccountCard: View {
                 else if recommended { Pill(text: "推荐", color: .orange) }
             }
             Ring(util: a.util, size: 78)
-            Text(subtitle).font(.system(size: 11)).foregroundColor(a.util == nil ? .orange : .secondary)
+            Text(subtitle).font(.system(size: 11)).foregroundColor(a.util == nil || (!a.hasProfile && !a.current) ? .orange : .secondary)
             action
         }
         .padding(12)
@@ -330,6 +331,16 @@ struct AccountCard: View {
             HStack(spacing: 6) {
                 Button("取消") { m.confirmFor = nil }.buttonStyle(.bordered).controlSize(.small)
                 Button("确认切换") { m.requestSwitch(a.name) }.buttonStyle(.borderedProminent).controlSize(.small)
+            }
+        } else if !a.hasProfile {
+            if recommended {
+                Button { openInTerminal("login-desktop \(a.name)") } label: { Label("登录桌面版", systemImage: "person.crop.circle.badge.plus").frame(maxWidth: .infinity) }
+                    .buttonStyle(.borderedProminent).controlSize(.small).tint(.orange)
+                    .help("在 Claude 桌面版里登录这个号一次，之后就能一键切换")
+            } else {
+                Button { openInTerminal("login-desktop \(a.name)") } label: { Label("登录桌面版", systemImage: "person.crop.circle.badge.plus").frame(maxWidth: .infinity) }
+                    .buttonStyle(.bordered).controlSize(.small)
+                    .help("在 Claude 桌面版里登录这个号一次，之后就能一键切换")
             }
         } else if a.hasProfile {
             if recommended {
@@ -444,6 +455,8 @@ struct MainView: View {
             Banner(icon: "exclamationmark.circle.fill",
                    text: "任务「\(m.interrupted[0])」被额度打断了。切到 \(m.display(m.recTarget)) 后" + (m.autoResume ? "会自动续上" : "发一句「继续」即可"),
                    color: .orange)
+        } else if m.recAction == "need_login" {
+            Banner(icon: "person.crop.circle.badge.exclamationmark", text: m.recReason, color: .orange)
         } else if m.recAction == "switch" {
             Banner(icon: "lightbulb.fill", text: "建议切到 \(m.display(m.recTarget))：\(m.recReason)", color: .orange)
         } else if m.recAction == "wait" {
@@ -893,7 +906,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             t = " " + (model.current?.util.map { String(format: "%.0f%%", $0) } ?? "—")
         }
         let attr = NSMutableAttributedString(string: t, attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)])
-        if model.recAction == "switch" && model.switchingTo == nil {
+        if (model.recAction == "switch" || model.recAction == "need_login") && model.switchingTo == nil {
             attr.append(NSAttributedString(string: " ●", attributes: [.foregroundColor: NSColor.systemOrange, .font: NSFont.systemFont(ofSize: 8)]))
         }
         b.attributedTitle = attr
@@ -1053,6 +1066,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
                 sw.recAction = "switch"; sw.recTarget = sw.accts.first(where: { !$0.current })?.name; sw.recReason = "当前号已用 96%"
                 if let i = sw.accts.firstIndex(where: { $0.current }) { sw.accts[i].util = 96; sw.accts[i].running = true }
                 renderPNG(MainView(m: sw), "\(dir)/suggest-\(s).png", dark: dark)
+                let nl = Model(); nl.apply(runCduoSync(["status", "--json", "--cached"]).0)
+                if let c = nl.accts.firstIndex(where: { $0.current }), let o = nl.accts.firstIndex(where: { !$0.current }) {
+                    nl.accts[c].util = 99; nl.accts[o].util = 21; nl.accts[o].hasProfile = false
+                    nl.recAction = "need_login"; nl.recTarget = nl.accts[o].name
+                    nl.recReason = "\(nl.accts[o].display) 还有额度，但还没在桌面版登录过。点它卡片上的「登录桌面版」，登录一次以后就能一键切换"
+                }
+                renderPNG(MainView(m: nl), "\(dir)/needlogin-\(s).png", dark: dark)
                 let wt = Model(); wt.apply(runCduoSync(["status", "--json", "--cached"]).0)
                 wt.mode = "idle"; wt.recAction = "wait"; wt.waitUntil = Date().timeIntervalSince1970 + 3000; wt.waitCount = 1
                 for i in wt.accts.indices { wt.accts[i].util = 100; wt.accts[i].running = true }

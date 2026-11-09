@@ -177,6 +177,17 @@ usage.update(A={"util": 100.0, "resets_at": NOW+3600}, B={"util": 10.0, "resets_
 m.tick(cfg)
 ok(switched and not q(), f"auto_resume off → switch only: {switched}")
 
+# 12. 另一个号还有额度、但没在桌面版登录过 → need_login（不再误报"两个号都快用完了"）
+cfg["auto_switch"] = "notify"; cfg["auto_resume"] = True; m.save_config(cfg)
+shutil.rmtree(H/"desktop"/"B")
+st = m.load_state(); st["desktop_current"] = "A"
+st["accounts"] = {"A": dict(ok=True, util=99.0, resets_at=time.time()+3600, no5h=False), "B": dict(ok=True, util=21.0, resets_at=time.time()+9000, no5h=False)}
+r = m.recommend(cfg, st)
+ok(r["action"] == "need_login" and r["target"] == "B", f"no desktop login on B → need_login: {r}")
+st["accounts"]["B"]["util"] = 100.0
+r = m.recommend(cfg, st)
+ok(r["action"] == "wait", f"both truly exhausted → wait: {r['action']}")
+
 shutil.rmtree(T, ignore_errors=True)
 print(f"\n{'全部通过' if not FAILS else f'{len(FAILS)} 项失败'}")
 sys.exit(1 if FAILS else 0)

@@ -29,7 +29,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 HOME = pathlib.Path.home()
 CDUO = pathlib.Path(os.environ.get("CDUO_HOME", str(HOME / ".cduo")))
 CONFIG = CDUO / "config.json"
@@ -1011,6 +1011,14 @@ def recommend(cfg: dict, st: dict) -> dict:
         info[a["name"]] = {"util": eu, "running": window_running(u), "resets": u.get("resets_at") if window_running(u) else None}
     usable = [n for n, i in info.items() if i["util"] is None or i["util"] < thr]
     if not usable:
+        for a in cfg["accounts"]:          # 还有额度、只是没在桌面版登录过的号
+            if has_profile(a["name"]):
+                continue
+            eu = effective_util(st["accounts"].get(a["name"], {}))
+            if eu is not None and eu < thr:
+                return {"action": "need_login", "target": a["name"], "urgent": True,
+                        "reason": f"{lbl(cfg, a['name'])} 还有额度，但还没在桌面版登录过。"
+                                  f"点它卡片上的「登录桌面版」，登录一次以后就能一键切换"}
         soon = min((i["resets"] for i in info.values() if i["resets"]), default=None)
         return {"action": "wait", "target": None, "reason": f"两个号都快用完了，{hhmm(soon)} 恢复"}
     rank = sorted(usable, key=lambda n: (0 if info[n]["running"] else 1, info[n]["resets"] or 9e12,
@@ -1510,7 +1518,7 @@ def cmd_status(args, cfg):
             when = (f"{hhmm(u['resets_at'])} 刷新额度（还有 {dur(u['resets_at'] - now())}）" if window_running(u)
                     else "满额，还没开始计时")
             bar = f"{col}{'█' * filled}{'░' * (10 - filled)} 已用 {eu:3.0f}%{C['r']}  {when}"
-        prof = "" if has_profile(a["name"]) else f"  {C['d']}(未保存桌面登录){C['r']}"
+        prof = "" if has_profile(a["name"]) else f"  {C['y']}(还没在桌面版登录：cduo login-desktop {a['name']}){C['r']}"
         print(f" {mark} {(a.get('label') or a['name']):<8} {bar}{prof}")
     rec = st.get("recommend") or {}
     np_ = st.get("next_ping") or {}
@@ -1518,6 +1526,8 @@ def cmd_status(args, cfg):
         print(f" {C['y']}⇄ 建议切换到 {lbl(cfg, rec['target'])}：{rec['reason']}{C['r']}   → cduo switch {rec['target']}")
     elif rec.get("action") == "wait":
         print(f" {C['red']}⏸ {rec['reason']}{C['r']}")
+    elif rec.get("action") == "need_login":
+        print(f" {C['y']}! {rec['reason']}{C['r']}   → cduo login-desktop {rec['target']}")
     if np_.get("why"):
         print(f" {C['d']}{np_['why']}{C['r']}")
     hint = st.get("desktop_org") if isinstance(st.get("desktop_org"), dict) else None
@@ -1864,8 +1874,9 @@ def cmd_setup(args, cfg):
             t += ":00"
         hh, mm = map(int, t.split(":"))
         return f"{hh % 24:02d}:{mm:02d}"
-    ws = norm(ask("你一般几点开始用 Claude？(HH:MM)", "10:00"))
-    we = norm(ask("一般几点收工？(HH:MM)", "01:00"))
+    wh = cfg.get("work_hours") or {}
+    ws = norm(ask("你一般几点开始用 Claude？(HH:MM)", wh.get("start", "10:00")))
+    we = norm(ask("一般几点收工？(HH:MM)", wh.get("end", "01:00")))
     h, m = map(int, ws.split(":"))
     start = f"{(h - 4) % 24:02d}:{m:02d}"
     cfg["active_hours"] = {"start": start, "end": we}
@@ -1891,33 +1902,50 @@ def cmd_setup(args, cfg):
     for a in cfg["accounts"]:
         if has_profile(a["name"]):
             continue
-        uid = desktop_account_uuid()
-        if uid and uid == a.get("account_uuid"):
-            print(f"检测到桌面版当前登录的就是【{a['name']}】，保存它的登录（Claude 会重启一下）…")
-            cmd_capture(argparse.Namespace(name=a["name"], force=False, detached=False), cfg)
-            continue
-        print(f"\n接下来在桌面版登录【{a['name']}】（{a.get('email')}）。")
-        cur = current_desktop_profile(cfg, st)
-        if uid and not cur:
-            print("桌面版当前登录的账号不属于这两个号。")
-            if ask("把桌面版当前登录先备份起来再继续？(y/n)", "y") != "y":
-                die("已取消")
-            backup_desktop("foreign-login")
-        input("按回车：Claude 会以未登录状态重新打开 …")
-        cmd_desktop_login(argparse.Namespace(name=a["name"]), cfg) if (cur or not uid) else _foreign_login_reset(cfg)
-        while True:
-            input(f"在 Claude 里登录好【{a['name']}】后按回车 …")
-            uid2 = desktop_account_uuid()
-            if uid2 and (not a.get("account_uuid") or uid2 == a["account_uuid"]):
-                break
-            print("还没检测到这个账号的登录（如果刚登录，等几秒再按回车）。")
-        cmd_capture(argparse.Namespace(name=a["name"], force=False, detached=False), cfg)
+        desktop_login_flow(cfg, a, st)
 
     print()
     if ask("安装后台调度（每 5 分钟查额度、按 2.5h 错峰自动预热）和菜单栏？(y/n)", "y") == "y":
         install_agents()
     print(f"\n{C['g']}全部完成！{C['r']} 常用命令：cduo（看状态） · cduo switch（切号） · cduo doctor（自检）")
     cmd_status(argparse.Namespace(json=False, cached=False), cfg)
+
+
+def desktop_login_flow(cfg: dict, a: dict, st: dict) -> None:
+    """让桌面版登录某个号并保存快照（之后就能一键切换到它）。"""
+    uid = desktop_account_uuid()
+    if uid and uid == a.get("account_uuid"):
+        print(f"检测到桌面版当前登录的就是【{a['name']}】，保存它的登录（Claude 会重启一下）…")
+        cmd_capture(argparse.Namespace(name=a["name"], force=False, detached=False), cfg)
+        return
+    print(f"\n接下来在桌面版登录【{a['name']}】（{a.get('email') or '它的账号'}）。")
+    cur = current_desktop_profile(cfg, st)
+    if uid and not cur:
+        print("桌面版当前登录的账号不属于 Cduo 管理的号。")
+        if ask("把桌面版当前登录先备份起来再继续？(y/n)", "y") != "y":
+            die("已取消")
+        backup_desktop("foreign-login")
+    input("按回车：Claude 会以未登录状态重新打开 …")
+    cmd_desktop_login(argparse.Namespace(name=a["name"]), cfg) if (cur or not uid) else _foreign_login_reset(cfg)
+    while True:
+        input(f"在 Claude 里登录好【{a['name']}】后按回车 …")
+        uid2 = desktop_account_uuid()
+        if uid2 and (not a.get("account_uuid") or uid2 == a["account_uuid"]):
+            break
+        if uid2 and a.get("account_uuid") and uid2 != a["account_uuid"]:
+            print(f"Claude 里登录的不是【{a['name']}】（{a.get('email')}）。请在 Claude 里换成这个账号再按回车。")
+        else:
+            print("还没检测到这个账号的登录（如果刚登录，等几秒再按回车）。")
+    cmd_capture(argparse.Namespace(name=a["name"], force=False, detached=False), cfg)
+
+
+def cmd_login_desktop(args, cfg):
+    """只补"在桌面版登录这个号"这一步（setup 没走完、或登录过期时用）。"""
+    need_real_terminal(["login-desktop", args.name], "在桌面版登录")
+    a = get_account(cfg, args.name)
+    desktop_login_flow(cfg, a, load_state())
+    print(f"\n{C['g']}✓ 【{a['name']}】已经可以一键切换了{C['r']}")
+    notify(f"{lbl(cfg, a['name'])} 的桌面版登录已保存，可以一键切换了")
 
 
 def _foreign_login_reset(cfg):
@@ -1952,6 +1980,8 @@ def main():
     p.add_argument("--detached", action="store_true", help=argparse.SUPPRESS)
     p = sub.add_parser("desktop-login", help="存好当前登录后，让桌面版以未登录状态打开（用来登录新账号）")
     p.add_argument("name")
+    p = sub.add_parser("login-desktop", help="在桌面版登录某个号并保存（setup 没走完时补这一步）")
+    p.add_argument("name")
     p = sub.add_parser("ping", help="立刻预热（启动该账号的 5h 窗口）")
     p.add_argument("name")
     p = sub.add_parser("sync", help="同步桌面版各账号的会话列表")
@@ -1985,7 +2015,7 @@ def main():
     cmds = {"status": cmd_status, "switch": cmd_switch, "setup": cmd_setup, "add": cmd_add, "login": cmd_login,
             "capture": cmd_capture, "desktop-login": cmd_desktop_login, "ping": cmd_ping, "sync": cmd_sync,
             "tick": cmd_tick, "config": cmd_config, "agents": cmd_agents, "doctor": cmd_doctor,
-            "rename": cmd_rename, "pin-org": cmd_pin_org, "resume": cmd_resume}
+            "rename": cmd_rename, "pin-org": cmd_pin_org, "resume": cmd_resume, "login-desktop": cmd_login_desktop}
     if not args.cmd:
         args = ap.parse_args(["status"])
     try:
