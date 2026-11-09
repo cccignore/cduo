@@ -1,6 +1,6 @@
 ---
 name: cduo
-description: 切换 Claude 桌面版账号、查看两个账号的 5 小时额度。Use when the user says "切号", "换号", "切到另一个号", "切到 <账号名>", "额度怎么样", "看下额度", "还剩多少额度", "switch account".
+description: 切换 Claude 桌面版账号、查看两个账号的 5 小时额度、换号出问题时恢复登录。Use when the user says "切号", "换号", "切到另一个号", "切到 <账号名>", "额度怎么样", "看下额度", "还剩多少额度", "switch account", "换号后要重新登录", "恢复换号前的登录".
 ---
 
 # cduo：双账号切换 / 额度
@@ -15,6 +15,14 @@ description: 切换 Claude 桌面版账号、查看两个账号的 5 小时额�
 2. 运行 `~/.local/bin/cduo switch [名字]`。它会在后台等这一轮回复结束，然后自动重启 Claude 并换成目标账号。
 3. 告诉用户：Claude 十几秒后会自动重启；重启后点开原来的会话就能接着聊，上下文都在；换号后第一条消息会稍微多耗一点额度（缓存要重建）。
 4. 运行完 switch 后立刻结束本轮回复，不要再调用其他工具（否则会推迟重启）。
+
+如果 switch 报「没有换号：……」，说明 Claude 的文件结构和 cduo 认识的不一样，cduo 什么都没改。把原因转述给用户，建议运行 `~/.local/bin/cduo doctor` 看详情。
+
+## 换号出了问题
+用户说换号后 Claude 要求重新登录、或者想回到换号前的登录：
+1. 运行 `~/.local/bin/cduo restore` 列出备份（每次换号前都会自动备份），告诉用户有哪些。
+2. 用户确认后运行 `~/.local/bin/cduo restore latest`（或用户选的那个备份名）。它会等这一轮回复结束后重启 Claude 并恢复。
+3. 运行完 restore 后立刻结束本轮回复，不要再调用其他工具。
 
 ## 不要在这里做的事
 `cduo setup`、`cduo desktop-login` 需要在「终端」App 里交互运行，在这里只提示用户去终端执行。

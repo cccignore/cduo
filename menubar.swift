@@ -82,6 +82,48 @@ func userIdleSeconds() -> Double {
 
 let claudeBundleID = "com.anthropic.claudefordesktop"
 
+/// Claude 当前窗口的标题（要有辅助功能权限；拿不到就是 nil）
+func claudeWindowTitle() -> String? {
+    guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: claudeBundleID).first else { return nil }
+    let ax = AXUIElementCreateApplication(app.processIdentifier)
+    var win: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(ax, kAXFocusedWindowAttribute as CFString, &win) == .success,
+          let w = win, CFGetTypeID(w) == AXUIElementGetTypeID() else { return nil }
+    var title: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(w as! AXUIElement, kAXTitleAttribute as CFString, &title) == .success else { return nil }
+    return title as? String
+}
+
+/// 粘贴前的核对：窗口标题如果带着会话信息（不是空的，也不只是 "Claude"），就必须对得上要续上的会话。
+/// 标题里没有会话信息时没法核对，返回 true，交给发送后的核对（cduo resume check）。
+func windowMatchesSession(_ windowTitle: String?, sessionTitle: String) -> Bool {
+    let generic: Set<String> = ["", "claude", "claude code", "claude desktop"]
+    var core = (windowTitle ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    for suffix in [" - Claude", " – Claude", " — Claude", " | Claude"] where core.hasSuffix(suffix) {
+        core = String(core.dropLast(suffix.count))
+    }
+    core = core.trimmingCharacters(in: CharacterSet(charactersIn: " …."))
+    let st = sessionTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+    if generic.contains(core.lowercased()) || st.isEmpty { return true }
+    return st.contains(core) || core.contains(st)
+}
+
+/// 把剪贴板里的全部内容（文字、图片、文件……每种格式）存下来，用完原样放回去
+func savePasteboard(_ pb: NSPasteboard) -> [NSPasteboardItem] {
+    (pb.pasteboardItems ?? []).map { item in
+        let copy = NSPasteboardItem()
+        for t in item.types {
+            if let d = item.data(forType: t) { copy.setData(d, forType: t) }
+        }
+        return copy
+    }
+}
+
+func restorePasteboard(_ pb: NSPasteboard, _ items: [NSPasteboardItem]) {
+    pb.clearContents()
+    if !items.isEmpty { pb.writeObjects(items) }
+}
+
 // MARK: - 数据模型
 
 struct Acct: Identifiable, Equatable {
@@ -930,11 +972,34 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     }
 
     func drainQueue() {
-        let q = cduoDir + "/notify-queue.jsonl"
-        guard FileManager.default.fileExists(atPath: q), let s = try? String(contentsOfFile: q, encoding: .utf8) else { return }
-        try? FileManager.default.removeItem(atPath: q)
-        for line in s.split(separator: "\n") {
-            guard let d = line.data(using: .utf8), let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { continue }
+        let fm = FileManager.default
+        var msgs: [[String: Any]] = []
+        // 每条通知一个文件：cduo 先写临时文件（. 开头）再改名，这里只会读到写完整的文件，读一个删一个
+        let dir = cduoDir + "/notify"
+        if let names = try? fm.contentsOfDirectory(atPath: dir) {
+            for n in names.sorted() where n.hasSuffix(".json") && !n.hasPrefix(".") {
+                let p = dir + "/" + n
+                if let d = fm.contents(atPath: p),
+                   let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] { msgs.append(j) }
+                try? fm.removeItem(atPath: p)
+            }
+        }
+        // 旧版 cduo 留下的队列文件：先改名再读，读的过程中就不会再有人往里追加
+        let legacy = cduoDir + "/notify-queue.jsonl"
+        if fm.fileExists(atPath: legacy) {
+            let taken = legacy + ".draining"
+            try? fm.removeItem(atPath: taken)
+            if (try? fm.moveItem(atPath: legacy, toPath: taken)) != nil,
+               let s = try? String(contentsOfFile: taken, encoding: .utf8) {
+                for line in s.split(separator: "\n") {
+                    if let d = line.data(using: .utf8),
+                       let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] { msgs.append(j) }
+                }
+            }
+            try? fm.removeItem(atPath: taken)
+        }
+        guard !msgs.isEmpty else { return }
+        for j in msgs {
             post(title: j["title"] as? String ?? "Cduo", body: j["msg"] as? String ?? "", kind: j["kind"] as? String ?? "info", target: j["target"] as? String)
         }
         model.refresh(network: false)
@@ -965,12 +1030,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     }
 
     func performResume(session sid: String, message: String, title: String) {
-        let finish: (String) -> Void = { [weak self] act in
+        // note：没走到粘贴这一步的原因，会写进兜底通知里
+        let finish: (String, String?) -> Void = { [weak self] act, note in
             runCduo(["resume", act, sid]) { out, _ in
                 let r = (out.split(separator: "\n").last(where: { $0.hasPrefix("{") }).flatMap { $0.data(using: .utf8) })
                     .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
                 if (r["ok"] as? Bool) != true && (r["final"] as? Bool ?? true) {
-                    self?.postResumeFallback(session: sid, message: message, title: title)
+                    self?.postResumeFallback(session: sid, message: message, title: title,
+                                             sentTo: r["misdelivered_to"] as? String, note: note)
                 }
                 self?.resumeBusy = false
                 self?.model.refresh(network: false)
@@ -978,9 +1045,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         }
         guard AXIsProcessTrusted() else {
             if !askedAX { askedAX = true; requestAccessibility() }   // 第一次需要时请你授权一次
-            finish("manual"); return
+            finish("manual", nil); return
         }
-        guard userIdleSeconds() >= 5 else { finish("defer"); return }   // 你正在用电脑，晚点再试
+        guard userIdleSeconds() >= 5 else { finish("defer", nil); return }   // 你正在用电脑，晚点再试
         NSWorkspace.shared.open(URL(string: "claude://code/continue?session=\(sid)")!)
         DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
             if NSWorkspace.shared.frontmostApplication?.bundleIdentifier != claudeBundleID {
@@ -988,38 +1055,54 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                 guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == claudeBundleID,
-                      userIdleSeconds() >= 3 else { finish("defer"); return }
+                      userIdleSeconds() >= 3 else { finish("defer", nil); return }
+                // 会话链接没跳过去时，前台开着的是别的会话：标题对不上就不粘贴
+                let wt = claudeWindowTitle()
+                guard windowMatchesSession(wt, sessionTitle: title) else {
+                    NSLog("Cduo resume: window title %@ does not match session %@, not pasting", wt ?? "", title)
+                    finish("manual", "没能确认 Claude 打开的就是这个会话，为免发错没有自动发送。")
+                    return
+                }
                 let pb = NSPasteboard.general
-                let old = pb.string(forType: .string)
+                let saved = savePasteboard(pb)
                 pb.clearContents(); pb.setString(message, forType: .string)
+                let ours = pb.changeCount
                 postKey(9, command: true)                     // ⌘V
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                     postKey(36)                               // 回车发送
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-                        pb.clearContents(); if let o = old { pb.setString(o, forType: .string) }
+                        // 这期间你又复制了别的东西，就不去覆盖它
+                        if pb.changeCount == ours { restorePasteboard(pb, saved) }
                     }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 6) { finish("check") }
+                    // 发送后核对一次；没对上就通知你手动处理，不再自动重试（免得重复发、发错地方）
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 6) { finish("check", nil) }
                 }
             }
         }
     }
 
-    func postResumeFallback(session sid: String, message: String, title: String) {
+    func postResumeFallback(session sid: String, message: String, title: String, sentTo: String? = nil, note: String? = nil) {
+        let name = title.isEmpty ? "会话" : title
         let c = UNMutableNotificationContent()
-        c.title = "续上被额度打断的任务"
-        c.body = "点这里打开「\(title.isEmpty ? "会话" : title)」，续上的话已经复制好，粘贴发送即可。"
+        if let wrong = sentTo {
+            c.title = "续上的话可能发错了会话"
+            c.body = "它出现在了「\(wrong)」里，请去看一眼。「\(name)」还没续上：点这里打开它，续上的话已经复制好，粘贴发送即可。"
+        } else {
+            c.title = "续上被额度打断的任务"
+            c.body = (note.map { $0 + "\n" } ?? "") + "点这里打开「\(name)」，续上的话已经复制好，粘贴发送即可。"
+        }
         c.categoryIdentifier = "RESUME"
         c.userInfo = ["session": sid, "message": message]
         if notifAuthorized {
             UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil))
         } else {
-            post(title: c.title, body: "打开「\(title)」发一句「继续」即可", kind: "info", target: nil)
+            post(title: c.title, body: sentTo == nil ? "打开「\(name)」发一句「继续」即可" : c.body, kind: "info", target: nil)
         }
     }
 
     func post(title: String, body: String, kind: String, target: String?) {
         if !notifAuthorized {
-            let esc = { (s: String) in s.replacingOccurrences(of: "\"", with: "\\\"") }
+            let esc = { (s: String) in s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") }
             let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
             p.arguments = ["-e", "display notification \"\(esc(body))\" with title \"\(esc(title))\""]
             try? p.run(); return
