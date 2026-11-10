@@ -7,7 +7,8 @@ SRC = sys.argv[1] if len(sys.argv) > 1 else str(pathlib.Path(__file__).resolve()
 T = pathlib.Path(tempfile.mkdtemp(prefix="cduo-test-"))
 H = T/"home"; AS = T/"appsupport"; PR = T/"projects"
 for d in (H, AS, PR): d.mkdir(parents=True)
-os.environ.update(CDUO_HOME=str(H), CDUO_APP_SUPPORT=str(AS), CDUO_FAKE_DESKTOP="1", CDUO_DRY_PING="1", CDUO_NO_NOTIFY="1")
+os.environ.update(CDUO_HOME=str(H), CDUO_APP_SUPPORT=str(AS), CDUO_FAKE_DESKTOP="1", CDUO_DRY_PING="1", CDUO_NO_NOTIFY="1",
+                  CDUO_RESUME_CHECK_WAIT="0")
 ld = importlib.machinery.SourceFileLoader("cduo", SRC); spec = importlib.util.spec_from_loader("cduo", ld)
 m = importlib.util.module_from_spec(spec); ld.exec_module(m)
 
@@ -56,6 +57,7 @@ m.fetch_account_usage = fake_fetch
 app = {"up": True}
 m.desktop_pids = lambda: [4242] if app["up"] else []
 m.wait_idle = lambda *a, **k: True
+m.user_idle_seconds = lambda: 7200.0   # 假装你已经离开电脑两小时（不读真实的键盘鼠标空闲时间）
 for fn in ("save_profile", "restore_profile", "pin_org_for", "backup_desktop"):
     setattr(m, fn, lambda *a, **k: None)
 m.sync_sessions = lambda *a, **k: {}
@@ -103,11 +105,23 @@ def run(argv):
     return buf.getvalue().strip()
 qq = m.load_resume_q(); qq["items"] = [i for i in qq["items"] if i["session"] == S1]; qq["items"][0]["not_before"] = 0; m.write_json(m.RESUME_Q, qq)
 got = json.loads(run(["next"])); ok(got.get("session") == S1 and got.get("state") == "typing", "next hands out S1")
-r = json.loads(run(["check", S1])); ok(r["ok"] is False and r["final"] is False, f"check w/o message → retry: {r}")
-qq = m.load_resume_q(); qq["items"][0]["not_before"] = 0; m.write_json(m.RESUME_Q, qq)
+# 3a. 粘贴、回车之后，目标会话里没出现这句话：不再盲目重试（可能重复发、发错地方），改为通知你手动处理
+r = json.loads(run(["check", S1]))
+ok(r["ok"] is False and r["final"] is True and q()[0]["state"] == "manual", f"check w/o message → manual, no blind retry: {r}")
+# 3b. 会话里出现了续上的话 → done
+qq = m.load_resume_q(); qq["items"][0].update(state="pending", not_before=0); m.write_json(m.RESUME_Q, qq)
 got = json.loads(run(["next"]))
 with open(P1, "a") as fh: fh.write(json.dumps(U(m.RESUME_TEXT["switch"], time.time())) + "\n")
 r = json.loads(run(["check", S1])); ok(r["ok"] is True and q()[0]["state"] == "done", f"check with message → done: {r}")
+# 3c. 续上的话出现在了别的会话里 → 标记"发错了"，告诉你是哪个会话，也不重试
+S13, P13 = session("target-13", [U("x", time.time()-50), A("好的", time.time()-40)])   # 只用来当目标会话，不算被打断
+S14, P14 = session("wrong-14", [U("y", time.time()-50)])
+m.queue_resume([{"session": S13, "cli": P13.stem, "title": "target-13", "error_uuid": "e13", "at": time.time()}], "switch", delay=0)
+got = json.loads(run(["next"]))
+# （+2 秒：和 3b 里 S1 那句正常续上的话错开，现实里 Cduo 一次只续一个、间隔远不止 2 秒）
+with open(P14, "a") as fh: fh.write(json.dumps(U(m.RESUME_TEXT["switch"], time.time() + 2)) + "\n")
+r = json.loads(run(["check", S13]))
+ok(r["state"] == "misdelivered" and r["misdelivered_to"] == "wrong-14" and r["final"] is True, f"message landed elsewhere → reported: {r}")
 
 # 4. 两个号都用完 → 等待，不切换
 reset_q(); switched.clear(); notes.clear(); cur["name"] = "B"

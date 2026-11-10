@@ -1,0 +1,19 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python tests（系统自带的 python3，和用户机器上一样）
+        run: |
+          /usr/bin/python3 --version
+          /usr/bin/python3 tests/test_resume.py
+          /usr/bin/python3 tests/test_core.py
+          /usr/bin/python3 tests/test_multi.py
+      - name: Build the menu bar app
+        run: bash build_app.sh "$RUNNER_TEMP/build"

@@ -1,4 +1,4 @@
-// Cduo 菜单栏 App（SwiftUI 弹出面板）：两个 Claude 号的额度、一键切换、全部设置。
+// Cduo 菜单栏 App（SwiftUI 弹出面板）：多个 Claude 号的额度、一键切换、全部设置。
 // 构建：build_app.sh
 import Cocoa
 import SwiftUI
@@ -16,6 +16,7 @@ let procEnv = ProcessInfo.processInfo.environment
 let dumpMode = procEnv["CDUO_MENUBAR_DUMP"] == "1"
 let previewDir = procEnv["CDUO_PREVIEW_DIR"]
 let panelWidth: CGFloat = 348
+let cardsScrollHeight: CGFloat = 460   // 超过 4 个号时卡片区域的高度：两行多一点，看得出下面还有
 
 // MARK: - 工具
 
@@ -82,6 +83,48 @@ func userIdleSeconds() -> Double {
 
 let claudeBundleID = "com.anthropic.claudefordesktop"
 
+/// Claude 当前窗口的标题（要有辅助功能权限；拿不到就是 nil）
+func claudeWindowTitle() -> String? {
+    guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: claudeBundleID).first else { return nil }
+    let ax = AXUIElementCreateApplication(app.processIdentifier)
+    var win: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(ax, kAXFocusedWindowAttribute as CFString, &win) == .success,
+          let w = win, CFGetTypeID(w) == AXUIElementGetTypeID() else { return nil }
+    var title: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(w as! AXUIElement, kAXTitleAttribute as CFString, &title) == .success else { return nil }
+    return title as? String
+}
+
+/// 粘贴前的核对：窗口标题如果带着会话信息（不是空的，也不只是 "Claude"），就必须对得上要续上的会话。
+/// 标题里没有会话信息时没法核对，返回 true，交给发送后的核对（cduo resume check）。
+func windowMatchesSession(_ windowTitle: String?, sessionTitle: String) -> Bool {
+    let generic: Set<String> = ["", "claude", "claude code", "claude desktop"]
+    var core = (windowTitle ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    for suffix in [" - Claude", " – Claude", " — Claude", " | Claude"] where core.hasSuffix(suffix) {
+        core = String(core.dropLast(suffix.count))
+    }
+    core = core.trimmingCharacters(in: CharacterSet(charactersIn: " …."))
+    let st = sessionTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+    if generic.contains(core.lowercased()) || st.isEmpty { return true }
+    return st.contains(core) || core.contains(st)
+}
+
+/// 把剪贴板里的全部内容（文字、图片、文件……每种格式）存下来，用完原样放回去
+func savePasteboard(_ pb: NSPasteboard) -> [NSPasteboardItem] {
+    (pb.pasteboardItems ?? []).map { item in
+        let copy = NSPasteboardItem()
+        for t in item.types {
+            if let d = item.data(forType: t) { copy.setData(d, forType: t) }
+        }
+        return copy
+    }
+}
+
+func restorePasteboard(_ pb: NSPasteboard, _ items: [NSPasteboardItem]) {
+    pb.clearContents()
+    if !items.isEmpty { pb.writeObjects(items) }
+}
+
 // MARK: - 数据模型
 
 struct Acct: Identifiable, Equatable {
@@ -142,6 +185,18 @@ final class Model: ObservableObject {
     }
 
     var current: Acct? { accts.first(where: { $0.current }) }
+
+    /// 说"全部账号"时用：两个号就说"两个号"，更多就说"3 个号"
+    var allText: String { accts.count == 2 || accts.isEmpty ? "两个号" : "\(accts.count) 个号" }
+
+    /// 5 小时按号数均分：2 个号错开 2.5 小时，3 个号错开 1 小时 40 分……
+    var gapText: String {
+        let mins = 300 / max(accts.count, 2)
+        let h = mins / 60, mm = mins % 60
+        if mm == 30 { return "\(h).5 小时" }
+        if mm == 0 { return "\(h) 小时" }
+        return h == 0 ? "\(mm) 分钟" : "\(h) 小时 \(mm) 分"
+    }
 
     var events: [Event] {
         var ev: [Event] = []
@@ -414,7 +469,7 @@ struct MainView: View {
             header
             if !m.configured && m.loaded { welcome }
             else {
-                HStack(spacing: 10) { ForEach(m.accts.prefix(2)) { a in AccountCard(m: m, a: a) } }
+                cards
                 status
                 if !m.events.isEmpty { upcoming }
             }
@@ -423,12 +478,26 @@ struct MainView: View {
         .frame(width: panelWidth)
     }
 
+    /// 每行两张卡片；超过 4 个号（两行）就放进可以滚动的区域，免得面板比屏幕还高，
+    /// 这时正在用的号排在最前面，不会被藏在下面（4 个号以内保持原来的顺序，换号时卡片不跳动）
+    @ViewBuilder var cards: some View {
+        let list = m.accts.count > 4 ? m.accts.filter { $0.current } + m.accts.filter { !$0.current } : m.accts
+        let grid = LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)], spacing: 10) {
+            ForEach(list) { a in AccountCard(m: m, a: a) }
+        }
+        if m.accts.count > 4 {
+            ScrollView(.vertical, showsIndicators: true) { grid }.frame(height: cardsScrollHeight)
+        } else {
+            grid
+        }
+    }
+
     var header: some View {
         HStack(spacing: 10) {
             Logo(size: 28)
             VStack(alignment: .leading, spacing: 1) {
                 Text("Cduo").font(.system(size: 14, weight: .bold))
-                Text(m.configured ? "\(modeName) · 两个号错峰使用" : "两个 Claude 号，额度不浪费")
+                Text(m.configured ? "\(modeName) · \(m.allText)错峰使用" : "多个 Claude 号，额度不浪费")
                     .font(.system(size: 11)).foregroundColor(.secondary)
             }
             Spacer()
@@ -448,7 +517,7 @@ struct MainView: View {
             Banner(icon: "play.circle.fill", text: "正在续上被额度打断的任务「\(t.isEmpty ? "会话" : t)」…", color: .accentColor)
         } else if let w = m.waitUntil {
             Banner(icon: "hourglass",
-                   text: "两个号都用完了。" + (w > 0 ? "\(hhmm(w)) 有号刷新后自动换过去" : "等额度刷新后自动换过去")
+                   text: "\(m.allText)都用完了。" + (w > 0 ? "\(hhmm(w)) 有号刷新后自动换过去" : "等额度刷新后自动换过去")
                        + (m.waitCount > 0 && m.autoResume ? "，并续上 \(m.waitCount) 个被打断的任务" : ""),
                    color: .red)
         } else if !m.interrupted.isEmpty && m.mode != "idle" && m.recAction == "switch" {
@@ -462,7 +531,7 @@ struct MainView: View {
         } else if m.recAction == "wait" {
             Banner(icon: "hourglass", text: m.recReason, color: .red)
         } else if !m.prewarm {
-            Banner(icon: "pause.circle", text: "自动提前计时已关闭，两个号的刷新时间不会自动错开", color: .gray)
+            Banner(icon: "pause.circle", text: "自动提前计时已关闭，\(m.allText)的刷新时间不会自动错开", color: .gray)
         }
     }
 
@@ -493,7 +562,7 @@ struct MainView: View {
         VStack(spacing: 12) {
             Image(systemName: "person.2.circle").font(.system(size: 40)).foregroundColor(.accentColor)
             Text("还没有添加账号").font(.system(size: 14, weight: .semibold))
-            Text("设置向导会带你登录两个号，大约 5 分钟。过程中 Claude 会重启几次。")
+            Text("设置向导会带你登录你的号（两个或更多），每个号大约两三分钟。过程中 Claude 会重启几次。")
                 .font(.system(size: 12)).foregroundColor(.secondary).multilineTextAlignment(.center)
             Button { openInTerminal("setup") } label: { Text("开始设置").frame(maxWidth: .infinity) }
                 .buttonStyle(.borderedProminent).controlSize(.large)
@@ -531,7 +600,7 @@ struct SettingsView: View {
                         }.pickerStyle(.segmented).labelsHidden().frame(maxWidth: .infinity)
                         Text(["off": "只显示额度，不打扰你。",
                               "notify": "该换号时发通知，点通知上的「切换」即可。",
-                              "idle": "用完才换号，一点不浪费。两个号都用完时，等先刷新的那个。"][m.mode] ?? "")
+                              "idle": "用完才换号，一点不浪费。\(m.allText)都用完时，等先刷新的那个。"][m.mode] ?? "")
                             .font(.system(size: 11)).foregroundColor(.secondary).frame(maxWidth: .infinity, alignment: .leading)
                         if m.mode != "idle" {
                             row("用到多少算「快用完」") {
@@ -555,7 +624,7 @@ struct SettingsView: View {
                         row("切换前先确认") { toggle({ m.confirm }, { m.confirm = $0; m.set("confirm_switch", $0 ? "on" : "off") }) }
                     }
                     group("自动提前计时") {
-                        row("开启", note: "两个号错开 2.5 小时刷新额度") {
+                        row("开启", note: "\(m.allText)依次错开 \(m.gapText) 刷新额度") {
                             toggle({ m.prewarm }, { m.prewarm = $0; m.set("prewarm_enabled", $0 ? "on" : "off") })
                         }
                         if m.prewarm {
@@ -582,6 +651,9 @@ struct SettingsView: View {
                                     .buttonStyle(.borderless).help("让这个号立刻开始计时")
                             }
                         }
+                        Button { openInTerminal("setup --add") } label: { Label("添加账号", systemImage: "plus.circle") }
+                            .buttonStyle(.borderless).frame(maxWidth: .infinity, alignment: .leading)
+                            .help("在「终端」里登录一个新号，加进来一起错峰")
                         Text("改完名字按回车保存；▶︎ 让这个号立刻开始计时。")
                             .font(.system(size: 11)).foregroundColor(.secondary).frame(maxWidth: .infinity, alignment: .leading)
                     }
@@ -662,11 +734,34 @@ struct RootView: View {
     }
 }
 
-// MARK: - 菜单栏图标：两个圆环，弧长=已用额度，正在用的号中间有实心点
+// MARK: - 菜单栏图标：每个号一个圆环（最多 5 个），弧长=已用额度，正在用的号中间有实心点
+
+/// 号太多时菜单栏放不下：最多画 5 个圆环，正在用的号一定在里面
+func iconAccounts(_ accts: [Acct], max n: Int = 5) -> [Acct] {
+    if accts.isEmpty { return [Acct(), Acct()] }
+    guard accts.count > n else { return accts }
+    var list = Array(accts.prefix(n))
+    if let cur = accts.first(where: { $0.current }), !list.contains(where: { $0.current }) { list[n - 1] = cur }
+    return list
+}
+
+/// 自检用：把菜单栏图标放大画到白底上存成 PNG
+func dumpStatusIcon(_ accts: [Acct], _ path: String) {
+    let icon = statusIcon(accts)
+    let k: CGFloat = 4
+    let img = NSImage(size: NSSize(width: icon.size.width * k + 16, height: icon.size.height * k + 16), flipped: false) { r in
+        NSColor.white.setFill(); r.fill()
+        icon.draw(in: NSRect(x: 8, y: 8, width: icon.size.width * k, height: icon.size.height * k))
+        return true
+    }
+    guard let tiff = img.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff),
+          let png = rep.representation(using: .png, properties: [:]) else { return }
+    try? png.write(to: URL(fileURLWithPath: path))
+}
 
 func statusIcon(_ accts: [Acct]) -> NSImage {
-    let list = accts.isEmpty ? [Acct(), Acct()] : Array(accts.prefix(2))
-    let w: CGFloat = list.count > 1 ? 31 : 17
+    let list = iconAccounts(accts)
+    let w: CGFloat = 17 + CGFloat(max(list.count - 1, 0)) * 14
     let img = NSImage(size: NSSize(width: w, height: 18), flipped: false) { _ in
         for (i, a) in list.enumerated() {
             let c = NSPoint(x: 8.5 + CGFloat(i) * 14, y: 9)
@@ -930,11 +1025,34 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     }
 
     func drainQueue() {
-        let q = cduoDir + "/notify-queue.jsonl"
-        guard FileManager.default.fileExists(atPath: q), let s = try? String(contentsOfFile: q, encoding: .utf8) else { return }
-        try? FileManager.default.removeItem(atPath: q)
-        for line in s.split(separator: "\n") {
-            guard let d = line.data(using: .utf8), let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { continue }
+        let fm = FileManager.default
+        var msgs: [[String: Any]] = []
+        // 每条通知一个文件：cduo 先写临时文件（. 开头）再改名，这里只会读到写完整的文件，读一个删一个
+        let dir = cduoDir + "/notify"
+        if let names = try? fm.contentsOfDirectory(atPath: dir) {
+            for n in names.sorted() where n.hasSuffix(".json") && !n.hasPrefix(".") {
+                let p = dir + "/" + n
+                if let d = fm.contents(atPath: p),
+                   let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] { msgs.append(j) }
+                try? fm.removeItem(atPath: p)
+            }
+        }
+        // 旧版 cduo 留下的队列文件：先改名再读，读的过程中就不会再有人往里追加
+        let legacy = cduoDir + "/notify-queue.jsonl"
+        if fm.fileExists(atPath: legacy) {
+            let taken = legacy + ".draining"
+            try? fm.removeItem(atPath: taken)
+            if (try? fm.moveItem(atPath: legacy, toPath: taken)) != nil,
+               let s = try? String(contentsOfFile: taken, encoding: .utf8) {
+                for line in s.split(separator: "\n") {
+                    if let d = line.data(using: .utf8),
+                       let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] { msgs.append(j) }
+                }
+            }
+            try? fm.removeItem(atPath: taken)
+        }
+        guard !msgs.isEmpty else { return }
+        for j in msgs {
             post(title: j["title"] as? String ?? "Cduo", body: j["msg"] as? String ?? "", kind: j["kind"] as? String ?? "info", target: j["target"] as? String)
         }
         model.refresh(network: false)
@@ -965,12 +1083,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     }
 
     func performResume(session sid: String, message: String, title: String) {
-        let finish: (String) -> Void = { [weak self] act in
+        // note：没走到粘贴这一步的原因，会写进兜底通知里
+        let finish: (String, String?) -> Void = { [weak self] act, note in
             runCduo(["resume", act, sid]) { out, _ in
                 let r = (out.split(separator: "\n").last(where: { $0.hasPrefix("{") }).flatMap { $0.data(using: .utf8) })
                     .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
                 if (r["ok"] as? Bool) != true && (r["final"] as? Bool ?? true) {
-                    self?.postResumeFallback(session: sid, message: message, title: title)
+                    self?.postResumeFallback(session: sid, message: message, title: title,
+                                             sentTo: r["misdelivered_to"] as? String, note: note)
                 }
                 self?.resumeBusy = false
                 self?.model.refresh(network: false)
@@ -978,9 +1098,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         }
         guard AXIsProcessTrusted() else {
             if !askedAX { askedAX = true; requestAccessibility() }   // 第一次需要时请你授权一次
-            finish("manual"); return
+            finish("manual", nil); return
         }
-        guard userIdleSeconds() >= 5 else { finish("defer"); return }   // 你正在用电脑，晚点再试
+        guard userIdleSeconds() >= 5 else { finish("defer", nil); return }   // 你正在用电脑，晚点再试
         NSWorkspace.shared.open(URL(string: "claude://code/continue?session=\(sid)")!)
         DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
             if NSWorkspace.shared.frontmostApplication?.bundleIdentifier != claudeBundleID {
@@ -988,38 +1108,54 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                 guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == claudeBundleID,
-                      userIdleSeconds() >= 3 else { finish("defer"); return }
+                      userIdleSeconds() >= 3 else { finish("defer", nil); return }
+                // 会话链接没跳过去时，前台开着的是别的会话：标题对不上就不粘贴
+                let wt = claudeWindowTitle()
+                guard windowMatchesSession(wt, sessionTitle: title) else {
+                    NSLog("Cduo resume: window title %@ does not match session %@, not pasting", wt ?? "", title)
+                    finish("manual", "没能确认 Claude 打开的就是这个会话，为免发错没有自动发送。")
+                    return
+                }
                 let pb = NSPasteboard.general
-                let old = pb.string(forType: .string)
+                let saved = savePasteboard(pb)
                 pb.clearContents(); pb.setString(message, forType: .string)
+                let ours = pb.changeCount
                 postKey(9, command: true)                     // ⌘V
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                     postKey(36)                               // 回车发送
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-                        pb.clearContents(); if let o = old { pb.setString(o, forType: .string) }
+                        // 这期间你又复制了别的东西，就不去覆盖它
+                        if pb.changeCount == ours { restorePasteboard(pb, saved) }
                     }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 6) { finish("check") }
+                    // 发送后核对一次；没对上就通知你手动处理，不再自动重试（免得重复发、发错地方）
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 6) { finish("check", nil) }
                 }
             }
         }
     }
 
-    func postResumeFallback(session sid: String, message: String, title: String) {
+    func postResumeFallback(session sid: String, message: String, title: String, sentTo: String? = nil, note: String? = nil) {
+        let name = title.isEmpty ? "会话" : title
         let c = UNMutableNotificationContent()
-        c.title = "续上被额度打断的任务"
-        c.body = "点这里打开「\(title.isEmpty ? "会话" : title)」，续上的话已经复制好，粘贴发送即可。"
+        if let wrong = sentTo {
+            c.title = "续上的话可能发错了会话"
+            c.body = "它出现在了「\(wrong)」里，请去看一眼。「\(name)」还没续上：点这里打开它，续上的话已经复制好，粘贴发送即可。"
+        } else {
+            c.title = "续上被额度打断的任务"
+            c.body = (note.map { $0 + "\n" } ?? "") + "点这里打开「\(name)」，续上的话已经复制好，粘贴发送即可。"
+        }
         c.categoryIdentifier = "RESUME"
         c.userInfo = ["session": sid, "message": message]
         if notifAuthorized {
             UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil))
         } else {
-            post(title: c.title, body: "打开「\(title)」发一句「继续」即可", kind: "info", target: nil)
+            post(title: c.title, body: sentTo == nil ? "打开「\(name)」发一句「继续」即可" : c.body, kind: "info", target: nil)
         }
     }
 
     func post(title: String, body: String, kind: String, target: String?) {
         if !notifAuthorized {
-            let esc = { (s: String) in s.replacingOccurrences(of: "\"", with: "\\\"") }
+            let esc = { (s: String) in s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") }
             let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
             p.arguments = ["-e", "display notification \"\(esc(body))\" with title \"\(esc(title))\""]
             try? p.run(); return
@@ -1058,6 +1194,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         print("accounts:", model.accts.map { "\($0.display) \($0.util.map { String(format: "%.0f", $0) } ?? "?")%" })
         print("events:", model.events.map { "\(hhmm($0.time)) \($0.text)" })
         if let dir = previewDir {
+            dumpStatusIcon(model.accts, "\(dir)/statusicon.png")
             for dark in [false, true] {
                 let s = dark ? "dark" : "light"
                 renderPNG(MainView(m: model), "\(dir)/main-\(s).png", dark: dark)

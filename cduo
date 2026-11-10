@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""cduo — 两个 Claude 账号：桌面版一键切换（对话不丢）+ 5h 窗口错峰预热。
+"""cduo — 多个 Claude 账号（两个或更多）：桌面版一键切换（对话不丢）+ 5h 窗口错峰预热。
 
 只用 Python 3.9 标准库。数据都在 ~/.cduo/ 下：
   config.json   账号与偏好
@@ -35,21 +35,27 @@ CDUO = pathlib.Path(os.environ.get("CDUO_HOME", str(HOME / ".cduo")))
 CONFIG = CDUO / "config.json"
 STATE = CDUO / "state.json"
 RESUME_Q = CDUO / "resume-queue.json"
+NOTIFY_DIR = CDUO / "notify"          # 交给菜单栏发的通知，一条一个文件
 LOGDIR = CDUO / "logs"
+LOG_MAX = 2 * 1024 * 1024             # 单个日志超过 2MB 就轮转
 BACKUP = CDUO / "backup"
+BACKUP_KEEP = 15                      # 登录备份、会话列表备份各保留最近 15 份
 PROFILES = CDUO / "desktop"
 CLIROOT = CDUO / "cli"
 APP_SUPPORT = pathlib.Path(os.environ.get(
     "CDUO_APP_SUPPORT", str(HOME / "Library/Application Support/Claude")))
 SESSIONS_ROOT = APP_SUPPORT / "claude-code-sessions"
 BUNDLE_ID = "com.anthropic.claudefordesktop"
-DESKTOP_KEYS = ("oauth:tokenCacheV2", "oauth:tokenCache", "lastKnownAccountUuid")
+TOKEN_KEYS = ("oauth:tokenCacheV2", "oauth:tokenCache")
+DESKTOP_KEYS = TOKEN_KEYS + ("lastKnownAccountUuid",)
 COOKIE_FILES = ("Cookies", "Cookies-journal")
 PRESERVE_POINTER_KEYS = ("remoteMcpServersConfig",)
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+UA_FALLBACK_VERSION = "2.1.316"       # 读不到本机 claude 版本时，请求头里用这个
 WINDOW = 5 * 3600
+RESUME_CHECK_WAIT = float(os.environ.get("CDUO_RESUME_CHECK_WAIT", "10"))  # 发出续上的话后，最多再等几秒核对
 FAKE_DESKTOP = os.environ.get("CDUO_FAKE_DESKTOP") == "1"   # 测试用：不真的退出/启动 App
 DRY_PING = os.environ.get("CDUO_DRY_PING") == "1"           # 测试用：不真的发预热
 
@@ -82,10 +88,26 @@ def now() -> float:
     return time.time()
 
 
+def _rotate(p: pathlib.Path, max_bytes: int | None = None) -> None:
+    """文件超过上限就改名成 .1（只留一份旧的），日志不会无限变大。"""
+    try:
+        if p.stat().st_size > (max_bytes or LOG_MAX):
+            os.replace(p, p.with_name(p.name + ".1"))
+    except OSError:
+        pass
+
+
+def rotate_logs() -> None:
+    for name in ("cduo.log", "switch.log", "tick.out", "menubar.out"):
+        _rotate(LOGDIR / name)
+
+
 def log(msg: str, echo: bool = False) -> None:
     LOGDIR.mkdir(parents=True, exist_ok=True)
+    p = LOGDIR / "cduo.log"
+    _rotate(p)
     line = f"{dt.datetime.now():%Y-%m-%d %H:%M:%S} {msg}"
-    with open(LOGDIR / "cduo.log", "a", encoding="utf-8") as f:
+    with open(p, "a", encoding="utf-8") as f:
         f.write(line + "\n")
     if echo:
         print(msg)
@@ -168,14 +190,20 @@ def menubar_alive() -> bool:
 
 
 def notify(msg: str, title: str = "Cduo", kind: str = "info", target: str | None = None) -> None:
-    """菜单栏 App 在跑时交给它发（带按钮、图标统一）；否则用系统通知兜底。"""
+    """菜单栏 App 在跑时交给它发（带按钮、图标统一）；否则用系统通知兜底。
+
+    每条通知单独写成 notify/ 下的一个文件：先写临时文件再改名，菜单栏只会看到写完整的文件，
+    读完一个删一个。不会出现"菜单栏刚读完、这边又追加了一行，接着整个文件被删"而丢通知。
+    """
     if os.environ.get("CDUO_NO_NOTIFY") == "1":
         return
     if menubar_alive():
-        CDUO.mkdir(parents=True, exist_ok=True)
-        with open(CDUO / "notify-queue.jsonl", "a", encoding="utf-8") as f:
-            f.write(json.dumps({"t": now(), "title": title, "msg": msg, "kind": kind, "target": target},
-                               ensure_ascii=False) + "\n")
+        NOTIFY_DIR.mkdir(parents=True, exist_ok=True)
+        name = f"{time.time_ns()}-{os.getpid()}-{os.urandom(4).hex()}.json"
+        tmp = NOTIFY_DIR / f".{name}.tmp"
+        tmp.write_text(json.dumps({"t": now(), "title": title, "msg": msg, "kind": kind, "target": target},
+                                  ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, NOTIFY_DIR / name)
         return
     esc = lambda s: s.replace("\\", "\\\\").replace('"', '\\"')
     subprocess.run(["osascript", "-e",
@@ -263,6 +291,20 @@ def save_state(st: dict) -> None:
     write_json(STATE, st)
 
 
+def update_state(fn) -> dict:
+    """加锁 → 重新读 → 改 → 写回。
+
+    后台调度、菜单栏、换号进程会同时写 state.json。每个进程都只在锁里改自己负责的字段，
+    就不会拿几分钟前读到的旧数据，把别人刚写进去的内容（比如 last_switch）整份冲掉。
+    fn 里不能再调用 update_state（同一把锁不能重入）。
+    """
+    with file_lock("state"):
+        st = load_state()
+        fn(st)
+        save_state(st)
+        return st
+
+
 def get_account(cfg: dict, name: str) -> dict:
     for a in cfg["accounts"]:
         if a["name"] == name:
@@ -272,7 +314,12 @@ def get_account(cfg: dict, name: str) -> dict:
 
 
 def profile_dir(name: str) -> pathlib.Path:
-    return PROFILES / name
+    d = PROFILES / name
+    old = PROFILES / f".{name}.old"
+    if not d.exists() and old.exists():   # 上次换快照时正好被打断：把旧快照放回来
+        with contextlib.suppress(OSError):
+            os.replace(old, d)
+    return d
 
 
 def has_profile(name: str) -> bool:
@@ -364,10 +411,40 @@ def clean_env(cfg: dict, cli_dir: str | None = None) -> dict:
     return env
 
 
+def claude_version(cfg: dict) -> str:
+    """本机 claude 的版本号（查到了一天只查一次），放进请求头，免得写死的版本号越来越旧。"""
+    cache = CDUO / ".claude-version"
+    claude = cfg.get("claude_bin")
+    have = bool(claude and os.path.exists(claude))
+    try:
+        age = now() - cache.stat().st_mtime
+        v = cache.read_text().strip()
+        if re.fullmatch(r"\d+\.\d+\.\d+", v) and age < 86400:
+            return v
+        if not v and have and age < 3600:   # 上次跑了 claude 却没拿到版本号：一小时内别反复跑
+            return UA_FALLBACK_VERSION
+    except OSError:
+        pass
+    if not have:          # 没有 claude 可跑：不记缓存，等它装好后马上就能读到真实版本
+        return UA_FALLBACK_VERSION
+    v = ""
+    try:
+        out = subprocess.run([claude, "--version"], capture_output=True, text=True, timeout=20,
+                             env=clean_env(cfg)).stdout
+        m = re.search(r"\b(\d+\.\d+\.\d+)\b", out)
+        v = m.group(1) if m else ""
+    except Exception:
+        pass
+    with contextlib.suppress(OSError):
+        CDUO.mkdir(parents=True, exist_ok=True)
+        cache.write_text(v)
+    return v or UA_FALLBACK_VERSION
+
+
 def http_json(cfg: dict, url: str, data: dict | None = None, headers: dict | None = None, timeout=20):
     px = proxy_url(cfg)
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": px, "https": px} if px else {}))
-    h = {"User-Agent": "claude-cli/2.1.316 (external, cli)"}
+    h = {"User-Agent": f"claude-cli/{claude_version(cfg)} (external, cli)"}
     h.update(headers or {})
     body = None
     if data is not None:
@@ -425,43 +502,92 @@ def cli_identity(cli_dir: str) -> dict:
             "email": a.get("emailAddress"), "org_name": a.get("organizationName")}
 
 
+_TOKEN_ERR: dict = {}   # 账号名 -> 最近一次拿不到 token 的原因（显示在额度那一栏）
+
+
+def _take_refresh_lock(lock: pathlib.Path) -> bool:
+    """拿到刷新锁返回 True。锁超过 2 分钟还在，视为上次刷新中途退出了，直接接手。"""
+    try:
+        lock.mkdir()
+        return True
+    except FileExistsError:
+        pass
+    try:
+        if now() - lock.stat().st_mtime < 120:
+            return False
+    except FileNotFoundError:
+        pass
+    shutil.rmtree(lock, ignore_errors=True)
+    try:
+        lock.mkdir()
+        return True
+    except FileExistsError:
+        return False
+
+
 def ensure_fresh_token(cfg: dict, acct: dict, force: bool = False) -> str | None:
-    """返回可用的 access token。只有 cduo 自己的 CLI 目录（owned）才会主动刷新。"""
-    cli_dir = acct["cli_dir"]
+    """返回可用的 access token。只有 cduo 自己的 CLI 目录（owned）才会主动刷新。
+
+    剩不到 20 分钟时去刷新。刷新失败、或者别的进程正在刷新时，只要旧 token 还没真正过期就先用着，
+    不会因为一次刷新没成功就显示"凭据过期"。
+    """
+    name, cli_dir = acct["name"], acct["cli_dir"]
     full, where = read_creds(cli_dir)
     if not full or "claudeAiOauth" not in full:
+        _TOKEN_ERR[name] = "未登录"
         return None
     c = full["claudeAiOauth"]
-    fresh = c.get("expiresAt", 0) / 1000 - now() > 20 * 60
-    if fresh and not force:
+    left = c.get("expiresAt", 0) / 1000 - now()
+    usable = c.get("accessToken") if left > 60 else None     # 还能用（留 1 分钟余量）
+    if left > 20 * 60 and not force:
+        _TOKEN_ERR.pop(name, None)
         return c.get("accessToken")
     if not acct.get("owned") or not c.get("refreshToken"):
-        return c.get("accessToken") if fresh else None
+        if not usable:
+            _TOKEN_ERR[name] = "凭据过期" + ("" if acct.get("owned") else "（共用目录要由 claude 自己续期）")
+        return usable
     lock = pathlib.Path(cli_dir) / ".oauth_refresh.lock"
+    if not _take_refresh_lock(lock):
+        # 别的进程正在刷新：旧 token 能用就先用；不能用就等它刷完，再读一次新的
+        if usable:
+            return usable
+        for _ in range(15):
+            time.sleep(1)
+            if not lock.exists():
+                break
+        c2 = (read_creds(cli_dir)[0] or {}).get("claudeAiOauth") or {}
+        if c2.get("expiresAt", 0) / 1000 - now() > 60:
+            return c2.get("accessToken")
+        _TOKEN_ERR[name] = "凭据正在刷新，稍后再试"
+        return None
     try:
-        lock.mkdir()
-    except FileExistsError:
-        if now() - lock.stat().st_mtime < 120:
+        try:
+            r = http_json(cfg, TOKEN_URL, {"grant_type": "refresh_token", "refresh_token": c["refreshToken"],
+                                           "client_id": CLIENT_ID, "scope": " ".join(c.get("scopes") or [])},
+                          timeout=30)
+            access, expires_in = r["access_token"], int(r["expires_in"])
+        except Exception as e:
+            log(f"token refresh failed for {name}: {e}")
+            if usable:            # 刷新失败但旧 token 还没过期：先用着，下一轮再刷
+                return usable
+            code = f"HTTP {e.code}" if isinstance(e, urllib.error.HTTPError) else type(e).__name__
+            _TOKEN_ERR[name] = f"凭据过期，刷新失败（{code}）"
             return None
-        shutil.rmtree(lock, ignore_errors=True)
-        lock.mkdir()
-    try:
-        r = http_json(cfg, TOKEN_URL, {"grant_type": "refresh_token", "refresh_token": c["refreshToken"],
-                                       "client_id": CLIENT_ID, "scope": " ".join(c.get("scopes") or [])}, timeout=30)
         t = int(now() * 1000)
-        c["accessToken"] = r["access_token"]
+        c["accessToken"] = access
         c["refreshToken"] = r.get("refresh_token") or c["refreshToken"]
-        c["expiresAt"] = t + int(r["expires_in"]) * 1000
+        c["expiresAt"] = t + expires_in * 1000
         if r.get("refresh_token_expires_in"):
             c["refreshTokenExpiresAt"] = t + int(r["refresh_token_expires_in"]) * 1000
         if r.get("scope"):
             c["scopes"] = r["scope"].split()
-        write_creds(cli_dir, full, where)
-        log(f"refreshed CLI token for {acct['name']}")
-        return c["accessToken"]
-    except Exception as e:
-        log(f"token refresh failed for {acct['name']}: {e}")
-        return None
+        try:
+            write_creds(cli_dir, full, where)
+            log(f"refreshed CLI token for {name}")
+        except Exception as e:    # 没存进去也不耽误这一次用新 token
+            log(f"saving refreshed CLI token for {name} failed: {e}")
+        _TOKEN_ERR.pop(name, None)
+        return access
     finally:
         shutil.rmtree(lock, ignore_errors=True)
 
@@ -470,7 +596,7 @@ def fetch_account_usage(cfg: dict, acct: dict) -> dict:
     res = {"fetched": now(), "util": None, "resets_at": None, "ok": False, "error": None, "no5h": False}
     tok = ensure_fresh_token(cfg, acct)
     if not tok:
-        res["error"] = "凭据过期/未登录"
+        res["error"] = _TOKEN_ERR.get(acct["name"]) or "凭据过期/未登录"
         return res
     try:
         u = http_json(cfg, USAGE_URL, headers={"Authorization": f"Bearer {tok}", "anthropic-beta": "oauth-2025-04-20"})
@@ -584,7 +710,8 @@ def launch_desktop() -> None:
     subprocess.run(["open", "-b", BUNDLE_ID], capture_output=True)
 
 
-def last_transcript_write(cfg: dict) -> float:
+def _newest_any_transcript(cfg: dict) -> float:
+    """所有会话记录（包括终端里的 claude）最近一次写入的时间。认不出桌面版会话时才用这个退路。"""
     newest = 0.0
     for d in cfg.get("projects_dirs") or []:
         base = pathlib.Path(os.path.expanduser(d))
@@ -594,8 +721,6 @@ def last_transcript_write(cfg: dict) -> float:
             if not proj.is_dir():
                 continue
             try:
-                if proj.stat().st_mtime < newest - 5:
-                    pass
                 for e in os.scandir(proj.path):
                     if e.name.endswith(".jsonl"):
                         newest = max(newest, e.stat().st_mtime)
@@ -609,16 +734,108 @@ def last_transcript_write(cfg: dict) -> float:
     return newest
 
 
-def wait_idle(cfg: dict, quiet: int = 12, max_wait: int = 900) -> bool:
-    t0 = now()
-    calm = 0
+def _transcript_index(cfg: dict) -> dict:
+    """{会话 id: 会话记录文件}：把所有项目目录扫一遍建好索引（同一个 id 取最新的那份）。"""
+    idx, mt = {}, {}
+    for d in cfg.get("projects_dirs") or []:
+        base = os.path.expanduser(d)
+        if not os.path.isdir(base):
+            continue
+        for proj in os.scandir(base):
+            if not proj.is_dir():
+                continue
+            try:
+                for e in os.scandir(proj.path):
+                    if e.name.endswith(".jsonl"):
+                        sid, t = e.name[:-6], e.stat().st_mtime
+                        if t >= mt.get(sid, -1):
+                            idx[sid], mt[sid] = e.path, t
+            except (FileNotFoundError, PermissionError):
+                continue
+    return idx
+
+
+def desktop_activity_files(cfg: dict):
+    """桌面版 Claude Code 会话的记录文件，以及各自的子任务目录和记录（只看修改时间，很便宜）。
+
+    返回 None 表示认不出桌面版的会话（没有会话列表，或者一个记录文件都对不上）。
+    """
+    ptrs = _all_pointers()
+    if not ptrs:
+        return None
+    idx = _transcript_index(cfg)
+    files = []
+    for d in ptrs:
+        p = idx.get(str(d.get("cliSessionId") or ""))
+        if not p:
+            continue
+        files.append(p)
+        sub = os.path.join(p[:-6], "subagents")
+        if os.path.isdir(sub):
+            files.append(sub)       # 新开子任务时，目录本身的修改时间会变
+            with contextlib.suppress(OSError):
+                files += [os.path.join(sub, n) for n in os.listdir(sub) if n.endswith(".jsonl")]
+    return files or None
+
+
+def _newest_mtime(paths) -> float:
+    newest = 0.0
+    for f in paths:
+        with contextlib.suppress(OSError):
+            newest = max(newest, os.path.getmtime(f))
+    return newest
+
+
+def last_transcript_write(cfg: dict) -> float:
+    """桌面版 Claude Code 会话（含子任务）最近一次写记录的时间。
+
+    只看桌面版自己的会话：终端里一直在跑的 claude 不算，免得它一忙就永远换不了号。
+    认不出桌面版会话时退回到看全部记录：宁可多等一会儿，也不把正在跑的任务误判成空闲。
+    """
+    files = desktop_activity_files(cfg)
+    return _newest_any_transcript(cfg) if files is None else _newest_mtime(files)
+
+
+def user_idle_seconds():
+    """距离你上次碰键盘/鼠标过了多少秒（IOHIDSystem 的 HIDIdleTime）；读不到返回 None。"""
+    try:
+        out = subprocess.run(["ioreg", "-c", "IOHIDSystem", "-d", "4"], capture_output=True, text=True,
+                             timeout=5).stdout
+    except Exception:
+        return None
+    m = re.search(r'"HIDIdleTime"\s*=\s*(\d+)', out)
+    return int(m.group(1)) / 1e9 if m else None
+
+
+def user_away(seconds: float) -> bool:
+    """你是否已经 seconds 秒没碰键盘鼠标（读不到时按"是"算，和以前的行为一致）。"""
+    ui = user_idle_seconds()
+    return ui is None or ui >= seconds
+
+
+def wait_idle(cfg: dict, quiet: int = 12, max_wait: int = 900, user_idle: float = 0) -> bool:
+    """等桌面版的 Claude Code 会话安静下来：连续两次检查都超过 quiet 秒没写记录。
+
+    user_idle>0 时，还要等你这么多秒没碰键盘鼠标（自动换号用：别在你打字时把 App 关掉）。
+    会话列表每 30 秒重扫一次，中间只看这些文件的修改时间。
+    超时返回 False，原因记在 wait_idle.last_reason（"busy" = Claude 在忙，"user" = 你在用电脑）。
+    """
+    t0, calm, files, listed = now(), 0, None, 0.0
+    wait_idle.last_reason = ""
     while now() - t0 < max_wait:
-        if now() - last_transcript_write(cfg) >= quiet:
+        if now() - listed > 30:
+            files, listed = desktop_activity_files(cfg), now()
+        newest = _newest_any_transcript(cfg) if files is None else _newest_mtime(files)
+        busy = now() - newest < quiet
+        ui = user_idle_seconds() if user_idle > 0 else None
+        active = ui is not None and ui < user_idle
+        if not busy and not active:
             calm += 1
             if calm >= 2:
                 return True
         else:
             calm = 0
+            wait_idle.last_reason = "busy" if busy else "user"
         time.sleep(2)
     return False
 
@@ -669,17 +886,23 @@ def save_profile(name: str, account_uuid_expected: str | None = None) -> None:
     if account_uuid_expected and conf.get("lastKnownAccountUuid") != account_uuid_expected:
         raise RuntimeError("桌面版当前登录的账号和要保存的账号对不上")
     d = profile_dir(name)
-    d.mkdir(parents=True, exist_ok=True)
-    os.chmod(d, 0o700)
-    write_json(d / "oauth.json", {k: conf[k] for k in DESKTOP_KEYS if k in conf})
+    tmp, old = d.with_name(f".{name}.tmp"), d.with_name(f".{name}.old")
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    os.chmod(tmp, 0o700)
+    write_json(tmp / "oauth.json", {k: conf[k] for k in DESKTOP_KEYS if k in conf})
     for fn in COOKIE_FILES:
-        src, dst = APP_SUPPORT / fn, d / fn
+        src = APP_SUPPORT / fn
         if src.exists():
-            shutil.copy2(src, dst)
-            os.chmod(dst, 0o600)
-        elif dst.exists():
-            dst.unlink()
-    write_json(d / "meta.json", {"saved_at": now(), "account_uuid": conf.get("lastKnownAccountUuid")})
+            shutil.copy2(src, tmp / fn)
+            os.chmod(tmp / fn, 0o600)
+    write_json(tmp / "meta.json", {"saved_at": now(), "account_uuid": conf.get("lastKnownAccountUuid")})
+    # 新快照完整写好之后再整个换上去：中途出错，旧快照原封不动
+    shutil.rmtree(old, ignore_errors=True)
+    if d.exists():
+        os.replace(d, old)
+    os.replace(tmp, d)
+    shutil.rmtree(old, ignore_errors=True)
 
 
 # ── 固定组织：Claude 用 lastActiveOrg cookie 记住上次的组织 ──
@@ -729,6 +952,10 @@ def learn_org_cookie(org_uuid: str) -> bool:
     row = _org_cookie_row(APP_SUPPORT / "Cookies")
     if not row:
         return False
+    # macOS 上 Chromium 的 cookie 密文以 "v10" 开头。不是这个格式，说明加密方式变了，不能照搬到别的登录里
+    if not row["encrypted_value"].startswith(("763130", "763131")):
+        log(f"org cookie for {org_uuid[:8]} uses an unknown encryption format; not learning it")
+        return False
     m = read_json(ORG_COOKIES, {}) or {}
     for k, v in list(m.items()):   # 同一段密文不能对应两个组织
         if k != org_uuid and v.get("encrypted_value") == row["encrypted_value"]:
@@ -777,6 +1004,8 @@ def restore_profile(name: str) -> None:
     snap = read_json(d / "oauth.json", None)
     if not snap:
         raise RuntimeError(f"{name} 没有桌面版登录快照，先运行 cduo capture {name}")
+    if not any(snap.get(k) for k in TOKEN_KEYS):
+        raise RuntimeError(f"{name} 的桌面版登录快照里没有登录信息，请在 Claude 里登录它后重新保存：cduo capture {name}")
     path = desktop_config_path()
     conf = read_json(path, {}) or {}
     for k in DESKTOP_KEYS:
@@ -805,18 +1034,106 @@ def clear_desktop_login() -> None:
 
 
 def backup_desktop(tag: str) -> pathlib.Path:
-    dest = BACKUP / f"{dt.datetime.now():%Y%m%d-%H%M%S}-{tag}"
-    dest.mkdir(parents=True, exist_ok=True)
+    stamp = f"{dt.datetime.now():%Y%m%d-%H%M%S}"
+    dest, n = BACKUP / f"{stamp}-{tag}", 1
+    while dest.exists():            # 同一秒里备份了两次：别把上一份覆盖掉
+        n += 1
+        dest = BACKUP / f"{stamp}-{tag}-{n}"
+    dest.mkdir(parents=True)
     os.chmod(dest, 0o700)
     for fn in ("config.json",) + COOKIE_FILES:
         src = APP_SUPPORT / fn
         if src.exists():
             shutil.copy2(src, dest / fn)
-    # 只保留最近 15 份
-    olds = sorted([p for p in BACKUP.iterdir() if p.is_dir() and re.match(r"\d{8}-\d{6}-", p.name)])
-    for p in olds[:-15]:
-        shutil.rmtree(p, ignore_errors=True)
+    _prune_backups()
     return dest
+
+
+def _prune_backups() -> None:
+    """登录备份、会话列表备份各保留最近 BACKUP_KEEP 份。分开数，会话备份再多也不会把登录备份挤掉。"""
+    if not BACKUP.is_dir():
+        return
+    dirs = sorted(p for p in BACKUP.iterdir() if p.is_dir() and re.match(r"\d{8}-\d{6}-", p.name))
+    sessions = [p for p in dirs if p.name.endswith("-sessions")]
+    logins = [p for p in dirs if not p.name.endswith("-sessions")]
+    for group in (sessions, logins):
+        for p in group[:-BACKUP_KEEP]:
+            shutil.rmtree(p, ignore_errors=True)
+
+
+def list_desktop_backups() -> list:
+    """桌面版登录备份（旧的在前）。"""
+    if not BACKUP.is_dir():
+        return []
+    return sorted(p for p in BACKUP.iterdir()
+                  if p.is_dir() and not p.name.endswith("-sessions") and (p / "config.json").exists())
+
+
+def restore_desktop_backup(src: pathlib.Path) -> None:
+    """把一份备份放回桌面版目录（App 必须已退出）。备份里没有的文件要删掉，免得新旧 Cookies 混在一起。"""
+    for fn in ("config.json",) + COOKIE_FILES:
+        s, d = src / fn, APP_SUPPORT / fn
+        if s.exists():
+            tmp = d.with_name(f".{d.name}.cduo-restore")
+            shutil.copy2(s, tmp)
+            os.replace(tmp, d)
+        else:
+            with contextlib.suppress(FileNotFoundError):
+                d.unlink()
+
+
+# ── 兼容性检查：cduo 依赖桌面版没有公开的文件结构，动手前先确认还是认识的样子 ──
+
+def desktop_app_version():
+    for base in ("/Applications", str(HOME / "Applications")):
+        p = pathlib.Path(base) / "Claude.app/Contents/Info.plist"
+        try:
+            return plistlib.loads(p.read_bytes()).get("CFBundleShortVersionString")
+        except Exception:
+            continue
+    return None
+
+
+def _cookie_columns(db: pathlib.Path):
+    """Cookies 数据库 cookies 表的列名；读不了返回 None。读的是副本，不碰原文件。"""
+    import sqlite3
+    CDUO.mkdir(parents=True, exist_ok=True)
+    tmp = CDUO / f".cookies-schema.{os.getpid()}"
+    try:
+        shutil.copy2(db, tmp)
+        con = sqlite3.connect(str(tmp))
+        try:
+            return [r[1] for r in con.execute("pragma table_info(cookies)")]
+        finally:
+            con.close()
+    except Exception:
+        return None
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def desktop_compat_problems() -> list:
+    """桌面版的登录文件还是不是 cduo 认识的样子。返回问题列表；空列表 = 可以放心动手。"""
+    probs = []
+    p = desktop_config_path()
+    if p.exists():
+        try:
+            conf = read_json(p, {})
+        except RuntimeError as e:
+            return [f"读不了桌面版的 config.json（{e}）"]
+        if not isinstance(conf, dict):
+            return ["桌面版的 config.json 不是预期的格式"]
+        if conf.get("lastKnownAccountUuid") and not any(conf.get(k) for k in TOKEN_KEYS):
+            probs.append("config.json 里找不到登录信息（oauth:tokenCache）：桌面版可能已退出登录，"
+                         "也可能是 Claude 更新后换了登录的存法")
+    db = APP_SUPPORT / "Cookies"
+    if db.exists():
+        cols = _cookie_columns(db)
+        if cols is None:
+            probs.append("读不了桌面版的 Cookies 数据库")
+        elif not {"host_key", "name", "encrypted_value"} <= set(cols):
+            probs.append("桌面版 Cookies 数据库的表结构变了")
+    return probs
 
 
 # ───────────────────────── 桌面版：会话列表同步 ─────────────────────────
@@ -930,6 +1247,8 @@ def sync_sessions(dry: bool = False, verbose: bool = False, missing_only: bool =
         if arch != (idx.get("archived") or []) or (arch and not idx_p.exists()):
             idx["archived"] = arch
             _write_pointer(idx_p, idx)
+    if bk is not None:
+        _prune_backups()
     if not dry and (summary["copied"] or summary["updated"]):
         log(f"sync_sessions {summary}")
     return summary
@@ -960,6 +1279,11 @@ def prewarm_accounts(cfg: dict) -> list:
     return [a for a in cfg["accounts"] if a.get("prewarm", True)]
 
 
+def accounts_text(n: int) -> str:
+    """说"全部账号"时用：两个号就说"两个号"，更多就说"3 个号"。"""
+    return "两个号" if n == 2 else f"{n} 个号"
+
+
 def lbl(cfg: dict, name) -> str:
     """显示名：优先用备注。"""
     if not name:
@@ -971,7 +1295,7 @@ def lbl(cfg: dict, name) -> str:
 def plan_pings(cfg: dict, st: dict):
     """返回 (要立刻预热的账号, 说明, 下一次预计预热时间)。
 
-    规则：n 个账号的重置时刻在 5h 内均匀错开（2 个号=相隔 2.5h）。
+    规则：n 个账号的重置时刻在 5h 内均匀错开（2 个号=相隔 2.5h，3 个号=相隔 1h40m，以此类推）。
     - 都没在计时：先启动桌面版当前在用的那个；
     - 有在计时的：当最近启动的那个窗口已经跑了 5h/n，就启动下一个空闲账号。
     """
@@ -984,7 +1308,7 @@ def plan_pings(cfg: dict, st: dict):
     running = [a for a in accts if rs[a["name"]]]
     idle = [a for a in accts if not rs[a["name"]]]
     if not idle:
-        return None, "两个号都在计时，刷新时间已错开", None
+        return None, f"{accounts_text(n)}都在计时，刷新时间已错开", None
     cur = st.get("desktop_current")
     idle.sort(key=lambda a: (0 if a["name"] == cur else 1, accts.index(a)))
     first = lbl(cfg, idle[0]["name"])
@@ -993,7 +1317,7 @@ def plan_pings(cfg: dict, st: dict):
     latest = max(rs[a["name"]] for a in running)
     due = latest - (WINDOW - gap)
     if now() >= due:
-        return idle[0], f"现在让 {first} 开始计时（与另一个号错开 {dur(gap)}）", due
+        return idle[0], f"现在让 {first} 开始计时（与上一个号错开 {dur(gap)}）", due
     return None, f"{first} 将在 {hhmm(due)} 自动开始计时（错开 {dur(gap)}）", due
 
 
@@ -1020,7 +1344,8 @@ def recommend(cfg: dict, st: dict) -> dict:
                         "reason": f"{lbl(cfg, a['name'])} 还有额度，但还没在桌面版登录过。"
                                   f"点它卡片上的「登录桌面版」，登录一次以后就能一键切换"}
         soon = min((i["resets"] for i in info.values() if i["resets"]), default=None)
-        return {"action": "wait", "target": None, "reason": f"两个号都快用完了，{hhmm(soon)} 恢复"}
+        return {"action": "wait", "target": None,
+                "reason": f"{accounts_text(len(cfg['accounts']))}都快用完了，{hhmm(soon)} 恢复"}
     rank = sorted(usable, key=lambda n: (0 if info[n]["running"] else 1, info[n]["resets"] or 9e12,
                                          0 if n == cur else 1))
     best = rank[0]
@@ -1038,11 +1363,66 @@ def recommend(cfg: dict, st: dict) -> dict:
     return {"action": "stay", "target": cur, "reason": "当前用的就是最合适的号"}
 
 
+TICK_OWNED = ("desktop_org", "next_ping", "recommend", "interrupted", "resume_wait", "post_switch_warned")
+
+
+def _save_tick_state(cfg: dict, st: dict, notified0) -> None:
+    """把这一轮 tick 算出来的结果并进 state.json。
+
+    tick 中间要联网（预热最长 3 分钟），这期间换号、续上排队可能已经写了 last_switch、switching、
+    resume_handled 等字段。这里只写 tick 自己负责的字段，其余以文件里最新的为准。
+    """
+    def merge(cur: dict) -> None:
+        for name, u in st["accounts"].items():
+            old = cur["accounts"].get(name) or {}
+            new = dict(old) if (old.get("fetched") or 0) > (u.get("fetched") or 0) else dict(u)
+            if (old.get("last_ping") or 0) > (new.get("last_ping") or 0):
+                new["last_ping"], new["last_ping_ok"] = old["last_ping"], old.get("last_ping_ok", True)
+            cur["accounts"][name] = new
+        for k in TICK_OWNED:
+            if k in st:
+                cur[k] = st[k]
+            else:
+                cur.pop(k, None)
+        if cur.get("last_notified") == notified0:   # 期间没人动过才写（换号时会清空它，不能被冲回去）
+            cur["last_notified"] = st.get("last_notified")
+        dc = current_desktop_profile(cfg, cur)       # 以桌面版此刻的登录为准
+        if dc:
+            cur["desktop_current"] = dc
+    update_state(merge)
+
+
+def desktop_logged_in():
+    """桌面版现在是否处于登录状态；没有或读不了 config.json 时返回 None（判断不了）。"""
+    try:
+        conf = read_json(desktop_config_path(), None)
+    except RuntimeError:
+        return None
+    if not isinstance(conf, dict):
+        return None
+    return bool(conf.get("lastKnownAccountUuid")) and any(conf.get(k) for k in TOKEN_KEYS)
+
+
+def check_after_switch(st: dict, app_up: bool) -> None:
+    """换号后 1～30 分钟内，桌面版如果变成了未登录（比如 Claude 更新后不认快照了），提醒一次怎么恢复。"""
+    ls = st.get("last_switch") or {}
+    at = ls.get("at") or 0
+    if not app_up or not (60 < now() - at < 30 * 60) or st.get("post_switch_warned") == at:
+        return
+    if desktop_logged_in() is False:
+        notify("Claude 重启后是未登录状态。如果登录页一直不消失，运行 cduo restore latest 回到换号前的登录。",
+               "换号可能没成功")
+        log(f"post-switch check: desktop is logged out after switching to {ls.get('to')}")
+        st["post_switch_warned"] = at
+
+
 def tick(cfg: dict, verbose: bool = False, allow_ping: bool = True) -> dict:
     with file_lock("tick", blocking=False) as got:
         if not got:
             return load_state()
+        rotate_logs()
         st = load_state()
+        notified0 = st.get("last_notified")
         for a in cfg["accounts"]:
             prev = st["accounts"].get(a["name"], {})
             u = fetch_account_usage(cfg, a)
@@ -1097,6 +1477,7 @@ def tick(cfg: dict, verbose: bool = False, allow_ping: bool = True) -> dict:
         cur_u = effective_util(st["accounts"].get(cur, {})) if cur else None
         exhausted = bool(inter) or (cur_u is not None and cur_u >= 99.5)
         app_up = bool(desktop_pids())
+        check_after_switch(st, app_up)
         plan = None   # ("switch", 目标, 要续上的任务) / ("resume", None, 任务)
         if mode == "idle" and exhausted:
             if inter and cur_u is not None and cur_u < 90:      # 等的时候本号已经刷新
@@ -1113,13 +1494,15 @@ def tick(cfg: dict, verbose: bool = False, allow_ping: bool = True) -> dict:
                     st["resume_wait"] = {"until": soon, "count": len(inter)}
                     if st.get("last_notified") != f"wait:{soon}":
                         notify((f"{hhmm(soon)} 有号刷新后，会自动换过去" + ("并续上被打断的任务" if inter else ""))
-                               if soon else "等额度刷新后再继续", "两个号都用完了")
+                               if soon else "等额度刷新后再继续", f"{accounts_text(len(cfg['accounts']))}都用完了")
                         st["last_notified"] = f"wait:{soon}"
         if not (mode == "idle" and exhausted and not plan):
             st.pop("resume_wait", None)
         if mode == "idle" and not plan and rec.get("action") == "switch" and not rec.get("urgent") \
-                and app_up and now() - last_transcript_write(cfg) > 3600:
-            plan = ("switch", rec["target"], [])   # 离开超过 1 小时：缓存反正过期了，换号不多花
+                and app_up and now() - last_transcript_write(cfg) > 3600 and user_away(600):
+            # 桌面版的 Claude Code 会话 1 小时没动静（缓存反正过期了，换号不多花），而且你 10 分钟没碰电脑。
+            # 普通聊天的回复不写会话记录，所以要靠"你离开了"来保证不会在你聊天、打字时把 App 重启掉
+            plan = ("switch", rec["target"], [])
         key = f"{rec.get('action')}:{rec.get('target')}"
         if mode != "idle" and rec.get("action") == "switch" and st.get("last_notified") != key and mode != "off":
             title = f"建议切换到 {lbl(cfg, rec['target'])}"
@@ -1130,16 +1513,23 @@ def tick(cfg: dict, verbose: bool = False, allow_ping: bool = True) -> dict:
             st["last_notified"] = key
         elif rec.get("action") != "switch" and not str(st.get("last_notified") or "").startswith("wait:"):
             st["last_notified"] = None
-        save_state(st)
+        _save_tick_state(cfg, st, notified0)
         if pinged:
             log(f"tick: pinged {pinged}")
+    if plan and plan[0] == "switch":
+        sw = load_state().get("switching") or {}
+        if now() - (sw.get("since") or 0) < 20 * 60:     # 菜单栏/命令行正在换号：别再插一脚
+            log(f"auto-switch to {plan[1]} skipped: switch to {sw.get('to')} already in progress")
+            plan = None
     if plan and plan[0] == "resume":
         if cfg.get("auto_resume", True) and app_up:
             queue_resume(plan[2], "reset", delay=2)
     elif plan:
         log(f"auto-switch to {plan[1]} ({rec.get('reason')}, app {'running' if app_up else 'closed'})")
         try:
-            do_switch(cfg, plan[1], after_turn=app_up, relaunch=app_up, resume=app_up)
+            # 自动换号要等你 30 秒没碰键盘鼠标，免得在你打字时把 App 关掉、草稿丢了
+            do_switch(cfg, plan[1], after_turn=app_up, relaunch=app_up, resume=app_up,
+                      user_idle=30 if app_up else 0)
         except SystemExit:
             pass
         except Exception as e:
@@ -1277,24 +1667,26 @@ def queue_resume(items: list, kind: str, delay: float = 12) -> int:
     """交给菜单栏 App：打开会话、粘贴一句"继续"、回车。"""
     if not items:
         return 0
-    q = load_resume_q()
-    have = {i.get("error_uuid") for i in q["items"]}
-    added = 0
-    for it in items:
-        if it["error_uuid"] in have:
-            continue
-        q["items"].append(dict(it, kind=kind, message=RESUME_TEXT.get(kind, RESUME_TEXT["switch"]),
-                               state="pending", attempts=0, queued_at=now(), not_before=now() + delay))
-        added += 1
-    q["items"] = [i for i in q["items"] if i.get("state") in ("pending", "typing")
-                  or now() - i.get("queued_at", 0) < 86400][-30:]
-    write_json(RESUME_Q, q)
-    st = load_state()
-    h = st.setdefault("resume_handled", {})
-    for it in items:
-        h[it["error_uuid"]] = now()
-    st["resume_handled"] = {k: v for k, v in h.items() if now() - v < 2 * 86400}
-    save_state(st)
+    with file_lock("resumeq"):   # 菜单栏的 resume next/check 也在改这个文件
+        q = load_resume_q()
+        have = {i.get("error_uuid") for i in q["items"]}
+        added = 0
+        for it in items:
+            if it["error_uuid"] in have:
+                continue
+            q["items"].append(dict(it, kind=kind, message=RESUME_TEXT.get(kind, RESUME_TEXT["switch"]),
+                                   state="pending", attempts=0, queued_at=now(), not_before=now() + delay))
+            added += 1
+        q["items"] = [i for i in q["items"] if i.get("state") in ("pending", "typing")
+                      or now() - i.get("queued_at", 0) < 86400][-30:]
+        write_json(RESUME_Q, q)
+
+    def mark(st):
+        h = st.setdefault("resume_handled", {})
+        for it in items:
+            h[it["error_uuid"]] = now()
+        st["resume_handled"] = {k: v for k, v in h.items() if now() - v < 2 * 86400}
+    update_state(mark)
     if added:
         log(f"resume queued ({kind}): " + ", ".join(i.get("title") or i["session"] for i in items))
         if not menubar_alive():
@@ -1306,56 +1698,118 @@ def _resume_item(q: dict, sid: str):
     return next((i for i in q["items"] if i.get("session") == sid and i.get("state") in ("pending", "typing")), None)
 
 
+def _marker_ts(path, t0: float) -> float:
+    """这份会话记录里，t0 之后 Cduo 那句续上的话最晚一次出现的时间；没有就是 0。"""
+    best = 0.0
+    if not path:
+        return best
+    try:
+        for e in tail_entries(path):
+            if e.get("type") == "user" and RESUME_MARK in entry_text(e):
+                ts = parse_iso(e.get("timestamp")) or 0
+                if ts >= t0:
+                    best = max(best, ts)
+    except OSError:
+        pass
+    return best
+
+
+def _marker_in(path, t0: float) -> bool:
+    return _marker_ts(path, t0) > 0
+
+
+def _marker_elsewhere(cfg: dict, t0: float, exclude_cli):
+    """续上的话没出现在目标会话里时，看看是不是发进了别的会话；是的话返回那个会话的标题。
+
+    同一时段别的会话也可能刚被正常续上过，所以取这句话出现得最晚的那个会话。
+    """
+    idx = _transcript_index(cfg)
+    best, best_ts = None, 0.0
+    for d in _all_pointers():
+        cli = str(d.get("cliSessionId") or "")
+        if not cli or cli == exclude_cli:
+            continue
+        p = idx.get(cli)
+        try:
+            if not p or os.path.getmtime(p) < t0:
+                continue
+        except OSError:
+            continue
+        ts = _marker_ts(p, t0)
+        if ts > best_ts:
+            best, best_ts = d.get("title") or d.get("sessionId"), ts
+    return best
+
+
 def cmd_resume(args, cfg):
     """resume SESSION        手动排一个续上任务（测试用，会话可写 last）
        resume next           菜单栏取下一个要续上的任务（JSON）
        resume check SESSION  菜单栏发完后核对：会话里出现了续上的消息才算成功
        resume defer|manual|fail SESSION"""
     act, sid = args.action, args.session
-    q = load_resume_q()
     if act == "next":
-        due = [i for i in q["items"] if i.get("state") == "pending" and i.get("not_before", 0) <= now()]
-        if not due or not desktop_pids():
+        if not desktop_pids():
             print("{}")
             return
-        it = due[0]
-        it["state"], it["attempts"], it["started_at"] = "typing", it.get("attempts", 0) + 1, now()
-        write_json(RESUME_Q, q)
+        with file_lock("resumeq"):
+            q = load_resume_q()
+            due = [i for i in q["items"] if i.get("state") == "pending" and i.get("not_before", 0) <= now()]
+            if not due:
+                print("{}")
+                return
+            it = due[0]
+            it["state"], it["attempts"], it["started_at"] = "typing", it.get("attempts", 0) + 1, now()
+            write_json(RESUME_Q, q)
         print(json.dumps(it, ensure_ascii=False))
         return
     if act in ("check", "defer", "manual", "fail"):
-        it = _resume_item(q, sid)
-        if not it:
+        it0 = _resume_item(load_resume_q(), sid)
+        if not it0:
             print(json.dumps({"ok": False, "final": True}))
             return
-        ok = False
-        if act == "check":
-            path = transcript_for(cfg, it.get("cli"))
-            if path:
-                t0 = it.get("started_at", 0) - 5
-                for e in tail_entries(path):
-                    ts = parse_iso(e.get("timestamp")) or 0
-                    if e.get("type") == "user" and ts >= t0 and RESUME_MARK in entry_text(e):
-                        ok = True
-                        break
-        final = True
-        if ok:
-            it["state"] = "done"
-            log(f"resumed: {it.get('title') or sid}")
-        elif act == "defer":                    # 你正在用电脑，晚点再试
-            waited = now() - it.get("queued_at", now())
-            if waited < 180:
-                it["state"], it["not_before"], final = "pending", now() + 20, False
+        ok, elsewhere = False, None
+        if act == "check":   # 核对时不拿锁：会话记录可能晚几秒才写，要等一会儿
+            t0 = it0.get("started_at", 0) - 5
+            deadline = now() + RESUME_CHECK_WAIT
+            while True:
+                ok = _marker_in(transcript_for(cfg, it0.get("cli")), t0)
+                if ok or now() >= deadline:
+                    break
+                time.sleep(1)
+            if not ok:
+                elsewhere = _marker_elsewhere(cfg, t0, it0.get("cli"))
+        with file_lock("resumeq"):
+            q = load_resume_q()
+            it = _resume_item(q, sid)
+            if not it:
+                print(json.dumps({"ok": ok, "final": True}))
+                return
+            final = True
+            if ok:
+                it["state"] = "done"
+                log(f"resumed: {it.get('title') or sid}")
+            elif act == "defer":                    # 你正在用电脑，还没粘贴：晚点再试
+                waited = now() - it.get("queued_at", now())
+                if waited < 180:
+                    it["state"], it["not_before"], final = "pending", now() + 20, False
+                else:
+                    it["state"] = "manual"
+            elif act == "check":
+                # 已经粘贴、按过回车，却没在目标会话里看到这句话：不再自动重试。
+                # 重试可能把同一句话再发进别的会话，或者在输入框里叠两份。改为通知你手动处理。
+                if elsewhere:
+                    it["state"], it["misdelivered_to"] = "misdelivered", elsewhere
+                else:
+                    it["state"] = "manual"
+                log(f"resume {it['state']}: {it.get('title') or sid}"
+                    + (f" (the message showed up in {elsewhere!r})" if elsewhere else ""))
             else:
-                it["state"] = "manual"
-        elif act == "check" and it.get("attempts", 0) < 2:
-            it["state"], it["not_before"], final = "pending", now() + 8, False
-        else:
-            it["state"] = "manual" if act in ("manual", "defer") else "failed"
-            log(f"resume {it['state']}: {it.get('title') or sid}")
-        write_json(RESUME_Q, q)
-        print(json.dumps({"ok": ok, "final": final, "state": it["state"], "message": it.get("message"),
-                          "title": it.get("title")}, ensure_ascii=False))
+                it["state"] = "manual" if act == "manual" else "failed"
+                log(f"resume {it['state']}: {it.get('title') or sid}")
+            write_json(RESUME_Q, q)
+            out = {"ok": ok, "final": final, "state": it["state"], "message": it.get("message"),
+                   "title": it.get("title"), "misdelivered_to": elsewhere}
+        print(json.dumps(out, ensure_ascii=False))
         return
     # 手动排队（测试用）
     me = os.environ.get("CLAUDE_CODE_HOST_SESSION_ID")
@@ -1393,6 +1847,7 @@ def pick_target(cfg: dict, st: dict, exclude=None):
 
 def spawn_detached(args: list) -> None:
     LOGDIR.mkdir(parents=True, exist_ok=True)
+    _rotate(LOGDIR / "switch.log")
     out = open(LOGDIR / "switch.log", "a")
     env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE_CODE_")}
     subprocess.Popen([sys.executable, os.path.abspath(__file__)] + args, stdin=subprocess.DEVNULL,
@@ -1400,7 +1855,8 @@ def spawn_detached(args: list) -> None:
 
 
 def do_switch(cfg: dict, target: str, after_turn: bool = False, relaunch: bool = True, force: bool = False,
-              resume: bool = True) -> None:
+              resume: bool = True, user_idle: float = 0) -> None:
+    """user_idle>0：还要等你这么多秒没碰键盘鼠标再重启 Claude（自动换号用）。"""
     get_account(cfg, target)
     if not has_profile(target):
         die(f"{target} 还没有桌面版登录快照。先在桌面版登录它，然后运行 cduo capture {target}")
@@ -1412,53 +1868,85 @@ def do_switch(cfg: dict, target: str, after_turn: bool = False, relaunch: bool =
     T = lbl(cfg, target)
 
     def phase(p):  # 给菜单栏看的进度
-        s = load_state()
-        s["switching"] = {"to": target, "phase": p, "since": now()} if p else None
-        save_state(s)
+        update_state(lambda s: s.__setitem__("switching", {"to": target, "phase": p, "since": now()} if p else None))
 
+    # 桌面版的文件不是 cduo 认识的样子（Claude 大版本更新可能改掉）：一个文件都不碰，也不用等、不用重启
+    problems = desktop_compat_problems()
+    if problems:
+        log("switch refused: " + "; ".join(problems))
+        notify("Claude 的数据结构和 Cduo 认识的不一样，为免弄坏登录没有换号。运行 cduo doctor 看详情", "切换取消")
+        die("没有换号：" + "；".join(problems))
     if after_turn and desktop_pids():
         phase("waiting")
         log(f"switch→{target}: waiting for idle")
-        if not wait_idle(cfg):
+        if not wait_idle(cfg, user_idle=user_idle):
             phase(None)
-            notify("Claude 一直在回复，切换已取消，稍后再试", "切换取消")
-            die("等了 15 分钟仍在忙，取消切换")
+            why = "你一直在用电脑" if getattr(wait_idle, "last_reason", "") == "user" else "Claude 一直在回复"
+            notify(f"{why}，切换已取消，稍后再试", "切换取消")
+            die(f"等了 15 分钟，{why}，取消切换")
     # 只有"被额度打断、之后没人动过"的任务才自动续上；正常换号什么都不发
     to_resume = interrupted_now(cfg, load_state()) if resume and cfg.get("auto_resume", True) else []
+    ver = desktop_app_version()
+    seen = st.get("desktop_versions_ok") or []
+    new_ver = bool(ver and seen and ver not in seen)   # Claude 更新后第一次换号
     with file_lock("switch"):
         was_running = bool(desktop_pids())
         phase("restarting")
         notify("Claude 会自动重启，约 10 秒", f"正在切换到 {T}")
-        quit_desktop()
-        backup_desktop(f"to-{target}")
+        try:
+            quit_desktop()
+        except Exception as e:
+            phase(None)
+            die(str(e))
+        bk = backup_desktop(f"to-{target}")
         try:
             if cur:
                 save_profile(cur)          # 桌面版会轮换 token，必须先把最新的存回去
             elif desktop_account_uuid() and not force:
                 raise RuntimeError("桌面版当前登录的账号不在 cduo 里，为免丢失登录已取消。先 cduo capture <名字>")
             restore_profile(target)
-            pin_org_for(cfg, target)
-            s = sync_sessions()
         except Exception as e:
+            # 写到一半失败：放回刚做的备份，免得桌面版卡在"一半新号、一半旧号"的状态
+            rolled = False
+            if bk:
+                try:
+                    restore_desktop_backup(bk)
+                    rolled = True
+                except Exception as e2:
+                    log(f"rollback from {bk.name} failed: {e2}")
             phase(None)
             if was_running:
                 launch_desktop()
-            die(str(e))
-        st = load_state()
-        st["desktop_current"] = target
-        st["last_switch"] = {"at": now(), "from": cur, "to": target}
-        st["last_notified"] = None
-        st["switching"] = None
-        save_state(st)
+            log(f"switch to {target} failed: {e}" + ("（rolled back）" if rolled else ""))
+            die(f"{e}" + ("（已恢复到切换前的登录）" if rolled else
+                          (f"（自动恢复失败，可以运行 cduo restore {bk.name} 手动恢复）" if bk else "")))
+        pin_org_for(cfg, target)           # 固定组织失败不影响换号（里面自己兜底）
+        try:
+            s = sync_sessions()
+        except Exception as e:             # 会话列表同步失败也不影响换号，后台调度会再补
+            log(f"sync_sessions after switch failed: {e}")
+            s = {"error": str(e)[:80]}
+
+        def done(st2):
+            st2["desktop_current"] = target
+            st2["last_switch"] = {"at": now(), "from": cur, "to": target}
+            st2["last_notified"] = None
+            st2["switching"] = None
+            if ver:
+                st2["desktop_versions_ok"] = ([v for v in (st2.get("desktop_versions_ok") or []) if v != ver]
+                                              + [ver])[-10:]
+        update_state(done)
         if relaunch and (was_running or not FAKE_DESKTOP):
             launch_desktop()
     msg = f"已切换到 {T}"
-    log(f"switch {cur} -> {target} {s}")
+    log(f"switch {cur} -> {target} {s}" + (f" (first switch on Claude {ver})" if new_ver else ""))
+    tip = (f"\nClaude 更新到了 {ver}，这是第一次在新版本上换号。如果打开后要求重新登录，运行 cduo restore latest"
+           if new_ver else "")
     if to_resume and relaunch and was_running:
         queue_resume(to_resume, "switch")
-        notify(f"Claude 打开后会自动续上 {len(to_resume)} 个被额度打断的任务", msg)
+        notify(f"Claude 打开后会自动续上 {len(to_resume)} 个被额度打断的任务" + tip, msg)
     else:
-        notify("点开原来的会话就能接着聊", msg)
+        notify("点开原来的会话就能接着聊" + tip, msg)
     print(f"{C['g']}✓ {msg}{C['r']}")
 
 
@@ -1553,7 +2041,8 @@ def cmd_switch(args, cfg):
             others = [a["name"] for a in cfg["accounts"] if a["name"] != cur and has_profile(a["name"])]
             if not others:
                 die("没有可切换的另一个账号（需要先保存桌面登录快照）")
-            target = others[0]
+            # 号多的时候"另一个号"不止一个：和自动换号同一个规则，挑还有余量、最早刷新的那个
+            target = pick_target(cfg, st, exclude=cur) or others[0]
     if (in_desktop_app() or under_claude_process()) and not args.detached:
         spawn_detached(["switch", target, "--after-turn", "--detached"] + (["--force"] if args.force else []))
         print(f"好的：等这一轮回复结束后（约十几秒），Claude 会自动重启并切到 {target}。"
@@ -1564,7 +2053,10 @@ def cmd_switch(args, cfg):
 
 def _with_app_closed(cfg, fn, tag: str):
     was = bool(desktop_pids())
-    quit_desktop()
+    try:
+        quit_desktop()
+    except RuntimeError as e:
+        die(str(e))
     backup_desktop(tag)
     try:
         fn()
@@ -1588,15 +2080,70 @@ def cmd_capture(args, cfg):
 
     def run():
         save_profile(args.name)
-        st = load_state()
-        st["desktop_current"] = args.name
-        save_state(st)
+        update_state(lambda st: st.__setitem__("desktop_current", args.name))
         sync_sessions()
 
     _with_app_closed(cfg, run, f"capture-{args.name}")
     print(f"{C['g']}✓ 已保存 {args.name} 的桌面版登录{C['r']}")
     log(f"captured desktop profile {args.name}")
     notify(f"已保存 {args.name} 的桌面版登录")
+
+
+def cmd_restore(args, cfg):
+    """把桌面版登录恢复到某次备份。每次换号、保存登录之前都会自动备份到 ~/.cduo/backup/。"""
+    bks = list_desktop_backups()
+    if not args.name:
+        if not bks:
+            print("还没有桌面版登录备份（每次换号前会自动备份）")
+            return
+        print("桌面版登录备份（越往下越新）：")
+        for p in bks:
+            try:
+                uid = (read_json(p / "config.json", {}) or {}).get("lastKnownAccountUuid")
+            except RuntimeError:
+                uid = None
+            who = next((lbl(cfg, a["name"]) for a in cfg["accounts"] if uid and a.get("account_uuid") == uid), None)
+            print(f"  {p.name}   {who or (uid[:8] + '…' if uid else '未登录')}")
+        print("\n恢复：cduo restore <上面的名字>，或 cduo restore latest（最近一次换号前的登录）")
+        return
+    if args.name == "latest":
+        cands = [p for p in bks if not p.name[16:].startswith("before-restore")]
+        src = cands[-1] if cands else None
+    elif re.match(r"^\d{8}-\d{6}-[\w.-]+$", args.name):
+        src = BACKUP / args.name
+    else:
+        src = None
+    if not src or not (src / "config.json").exists():
+        die(f"找不到备份 {args.name}（运行 cduo restore 看看有哪些）")
+    if (in_desktop_app() or under_claude_process()) and not args.detached:
+        spawn_detached(["restore", src.name, "--detached"])
+        print(f"好的：这一轮回复结束后 Claude 会重启，恢复到 {src.name} 时的登录。")
+        return
+    if args.detached:
+        wait_idle(cfg)
+
+    def run():
+        cur = current_desktop_profile(cfg, load_state())
+        if cur:   # 先把当前号最新的登录存好（桌面版会轮换 token），以后还能切回来
+            try:
+                save_profile(cur)
+            except Exception as e:
+                log(f"restore: could not save current profile {cur}: {e}")
+        restore_desktop_backup(src)
+
+        def fix(st):
+            dc = current_desktop_profile(cfg, st)
+            if dc:
+                st["desktop_current"] = dc
+            else:
+                st.pop("desktop_current", None)
+            st["switching"] = None
+        update_state(fix)
+
+    _with_app_closed(cfg, run, "before-restore")
+    log(f"restored desktop backup {src.name}")
+    print(f"{C['g']}✓ 已恢复到 {src.name} 时的桌面版登录{C['r']}（备份里的登录如果已经过期，Claude 会请你重新登录）")
+    notify(f"已恢复到 {src.name} 时的登录")
 
 
 def cmd_desktop_login(args, cfg):
@@ -1655,11 +2202,9 @@ def cmd_login(args, cfg):
 def cmd_ping(args, cfg):
     a = get_account(cfg, args.name)
     ok = do_ping(cfg, a, "手动")
-    st = load_state()
     u = fetch_account_usage(cfg, a)
     u["last_ping"], u["last_ping_ok"] = now(), ok
-    st["accounts"][a["name"]] = u
-    save_state(st)
+    update_state(lambda st: st["accounts"].__setitem__(a["name"], u))
     print(("✓ 已预热 " if ok else "✗ 预热失败 ") + a["name"] +
           (f"，窗口 {hhmm(u['resets_at'])} 重置" if window_running(u) else ""))
 
@@ -1734,6 +2279,38 @@ def cmd_pin_org(args, cfg):
     cfg["pin_org"] = True
     save_config(cfg)
     print(f"✓ 已固定：以后换号都会进入「{a.get('org_name')}」")
+
+
+def cmd_remove(args, cfg):
+    """不再让 cduo 管理某个号。
+
+    它的桌面版登录快照挪进备份目录；CLI 登录目录原样保留，以后用 cduo add 加回来不用重新授权。
+    """
+    a = get_account(cfg, args.name)
+    if current_desktop_profile(cfg, load_state()) == a["name"] and not args.force:
+        die(f"Claude 桌面版现在登录的就是 {args.name}。先切到别的号再移除（确定要移除就加 --force）")
+    cfg["accounts"] = [x for x in cfg["accounts"] if x["name"] != a["name"]]
+    save_config(cfg)
+
+    def drop(st):
+        st["accounts"].pop(a["name"], None)
+        if st.get("desktop_current") == a["name"]:
+            st.pop("desktop_current", None)
+        if (st.get("recommend") or {}).get("target") == a["name"]:
+            st.pop("recommend", None)
+    update_state(drop)
+    moved = None
+    d = profile_dir(a["name"])
+    if d.exists():
+        moved = BACKUP / f"{dt.datetime.now():%Y%m%d-%H%M%S}-removed-{a['name']}"
+        moved.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(d), str(moved))
+    log(f"removed account {a['name']}" + (f" (desktop snapshot moved to {moved.name})" if moved else ""))
+    print(f"{C['g']}✓ 已移除 {args.name}{C['r']}" + (f"（桌面版登录快照挪到了 {moved}）" if moved else ""))
+    if a.get("owned"):
+        print(f"  它的 CLI 登录还留在 {a['cli_dir']}，以后 cduo add {args.name} 加回来不用重新授权。")
+    if len(cfg["accounts"]) < 2:
+        print(f"{C['y']}! 现在只剩 {len(cfg['accounts'])} 个号了，换号、错峰都需要至少两个：cduo setup --add{C['r']}")
 
 
 def cmd_rename(args, cfg):
@@ -1837,6 +2414,14 @@ def cmd_doctor(args, cfg):
     print(f" {ok(cb and os.path.exists(cb))} claude 命令: {cb}")
     print(f" {ok(True)} 代理: {proxy_url(cfg) or '不使用'}")
     print(f" {ok(desktop_config_path().exists())} 桌面版数据: {APP_SUPPORT}")
+    ver = desktop_app_version()
+    seen = load_state().get("desktop_versions_ok") or []
+    print(f"   桌面版版本: {ver or '未知'}"
+          + ("（已在这个版本上换号成功过）" if ver and ver in seen else
+             "（还没在这个版本上换过号）" if ver and seen else ""))
+    probs = desktop_compat_problems()
+    print(f" {ok(not probs)} 桌面版文件结构: " + ("cduo 认识" if not probs else "；".join(probs)))
+    print(f"   登录备份: {len(list_desktop_backups())} 份（cduo restore 查看 / 恢复）")
     print(f"   桌面版当前账号: {current_desktop_profile(cfg, load_state()) or desktop_account_uuid() or '未登录'}"
           f"   （App {'运行中' if desktop_pids() else '未运行'}）")
     for a in cfg["accounts"]:
@@ -1859,44 +2444,71 @@ def ask(prompt: str, default: str = "") -> str:
     return s or default
 
 
+def _setup_add_account(cfg: dict) -> dict:
+    """设置向导里加一个号：起名 → 在浏览器里给 CLI 授权（查额度、预热用）。"""
+    print(f"{C['b']}— 第 {len(cfg['accounts']) + 1} 个账号 —{C['r']}")
+    while True:   # 名字不合规或重名就重问，别让整个向导直接退出
+        name = ask("给它起个短名字（字母/数字，如 neu、me）")
+        if not re.match(r"^[A-Za-z0-9_-]{1,16}$", name):
+            print("名字只能用字母、数字、- 和 _，最长 16 个字符。")
+        elif any(a["name"] == name for a in cfg["accounts"]):
+            print(f"已经有一个叫 {name} 的号了，换个名字。")
+        else:
+            break
+    label = ask("备注（可选）", name)
+    reuse = ask("要复用已有的 Claude Code 配置目录吗？直接回车=新建专用目录（推荐）", "")
+    cmd_add(argparse.Namespace(name=name, label=label, cli_dir=reuse or None), cfg)
+    a = get_account(cfg, name)
+    if not read_creds(a["cli_dir"])[0]:
+        while not cli_login(cfg, a):
+            if ask("重试登录？(y/n)", "y") != "y":
+                break
+    twin = next((x for x in cfg["accounts"] if x is not a and x.get("account_uuid")
+                 and x.get("account_uuid") == a.get("account_uuid") and x.get("org_uuid") == a.get("org_uuid")), None)
+    if twin:
+        print(f"{C['y']}! 这个号和【{twin['name']}】是同一个账号、同一个组织，额度是共用的，加两次没有用。"
+              f"可以用 cduo remove {name} 去掉它。{C['r']}")
+    print()
+    return a
+
+
 def cmd_setup(args, cfg):
-    need_real_terminal(["setup"], "设置")
-    print(f"{C['b']}cduo 设置向导{C['r']}（随时 Ctrl-C 退出，重新运行会接着来）\n")
+    want_add = bool(getattr(args, "add", False))
+    adding = want_add and len(cfg["accounts"]) >= 2      # 已经设置过：只再加一个号，不再问作息时间
+    need_real_terminal(["setup"] + (["--add"] if want_add else []), "设置")
+    print(f"{C['b']}cduo：再加一个号{C['r']}（随时 Ctrl-C 退出）\n" if adding else
+          f"{C['b']}cduo 设置向导{C['r']}（随时 Ctrl-C 退出，重新运行会接着来）\n")
     if not cfg.get("claude_bin"):
         cfg["claude_bin"] = find_claude_bin()
     print(f"claude 命令: {cfg.get('claude_bin') or '没找到'}")
     if not cfg.get("claude_bin"):
         cfg["claude_bin"] = ask("请输入 claude 可执行文件的完整路径")
     print(f"代理: {proxy_url(cfg) or '不使用'}（跟随系统设置）\n")
-    def norm(t):
-        t = t.replace("：", ":").strip()
-        if ":" not in t:
-            t += ":00"
-        hh, mm = map(int, t.split(":"))
-        return f"{hh % 24:02d}:{mm:02d}"
-    wh = cfg.get("work_hours") or {}
-    ws = norm(ask("你一般几点开始用 Claude？(HH:MM)", wh.get("start", "10:00")))
-    we = norm(ask("一般几点收工？(HH:MM)", wh.get("end", "01:00")))
-    h, m = map(int, ws.split(":"))
-    start = f"{(h - 4) % 24:02d}:{m:02d}"
-    cfg["active_hours"] = {"start": start, "end": we}
-    cfg["work_hours"] = {"start": ws, "end": we}
-    print(f"→ 自动预热时段设为 {start}–{we}（开工前约 4 小时预热第一个号，开工后约 1 小时就会有一次额度刷新）\n")
+    if not adding:
+        def norm(t):
+            t = t.replace("：", ":").strip()
+            if ":" not in t:
+                t += ":00"
+            hh, mm = map(int, t.split(":"))
+            return f"{hh % 24:02d}:{mm:02d}"
+        wh = cfg.get("work_hours") or {}
+        ws = norm(ask("你一般几点开始用 Claude？(HH:MM)", wh.get("start", "10:00")))
+        we = norm(ask("一般几点收工？(HH:MM)", wh.get("end", "01:00")))
+        h, m = map(int, ws.split(":"))
+        start = f"{(h - 4) % 24:02d}:{m:02d}"
+        cfg["active_hours"] = {"start": start, "end": we}
+        cfg["work_hours"] = {"start": ws, "end": we}
+        print(f"→ 自动预热时段设为 {start}–{we}（开工前约 4 小时预热第一个号，开工后约 1 小时就会有一次额度刷新）\n")
     save_config(cfg)
 
-    while len(cfg["accounts"]) < 2:
-        i = len(cfg["accounts"]) + 1
-        print(f"{C['b']}— 第 {i} 个账号 —{C['r']}")
-        name = ask("给它起个短名字（字母/数字，如 neu、me）")
-        label = ask("备注（可选）", name)
-        reuse = ask("要复用已有的 Claude Code 配置目录吗？直接回车=新建专用目录（推荐）", "")
-        cmd_add(argparse.Namespace(name=name, label=label, cli_dir=reuse or None), cfg)
-        a = get_account(cfg, name)
-        if not read_creds(a["cli_dir"])[0]:
-            while not cli_login(cfg, a):
-                if ask("重试登录？(y/n)", "y") != "y":
-                    break
-        print()
+    while len(cfg["accounts"]) < 2:      # 至少两个号
+        _setup_add_account(cfg)
+    if adding:
+        _setup_add_account(cfg)
+    else:
+        while ask(f"现在有 {len(cfg['accounts'])} 个号。还要再加一个吗？号越多，刷新时间错得越密 (y/n)",
+                  "n").strip().lower() == "y":
+            _setup_add_account(cfg)
 
     st = load_state()
     for a in cfg["accounts"]:
@@ -1905,7 +2517,11 @@ def cmd_setup(args, cfg):
         desktop_login_flow(cfg, a, st)
 
     print()
-    if ask("安装后台调度（每 5 分钟查额度、按 2.5h 错峰自动预热）和菜单栏？(y/n)", "y") == "y":
+    gap = dur(WINDOW / max(1, len(prewarm_accounts(cfg))))
+    if adding and agent_path(AGENT_TICK).exists():
+        print(f"后台调度已经在跑，新加的号 5 分钟内就会算进去（{accounts_text(len(cfg['accounts']))}按 {gap} 错峰）。")
+    elif ask(f"安装后台调度（每 5 分钟查额度、{accounts_text(len(cfg['accounts']))}按 {gap} 错峰自动预热）和菜单栏？(y/n)",
+             "y") == "y":
         install_agents()
     print(f"\n{C['g']}全部完成！{C['r']} 常用命令：cduo（看状态） · cduo switch（切号） · cduo doctor（自检）")
     cmd_status(argparse.Namespace(json=False, cached=False), cfg)
@@ -1955,10 +2571,10 @@ def _foreign_login_reset(cfg):
 
 
 def main():
-    ap = argparse.ArgumentParser(prog="cduo", description="两个 Claude 账号：桌面版一键切换 + 5h 窗口错峰预热")
+    ap = argparse.ArgumentParser(prog="cduo", description="多个 Claude 账号：桌面版一键切换 + 5h 窗口错峰预热")
     ap.add_argument("--version", action="version", version=VERSION)
     sub = ap.add_subparsers(dest="cmd")
-    p = sub.add_parser("status", help="看两个号的额度和建议（默认命令）")
+    p = sub.add_parser("status", help="看各个号的额度和建议（默认命令）")
     p.add_argument("--json", action="store_true")
     p.add_argument("--cached", action="store_true", help="只读上次的状态，不联网")
     p = sub.add_parser("switch", help="切换桌面版账号（不填名字=按规则自动选）")
@@ -1967,8 +2583,9 @@ def main():
     p.add_argument("--no-relaunch", action="store_true")
     p.add_argument("--force", action="store_true")
     p.add_argument("--detached", action="store_true", help=argparse.SUPPRESS)
-    sub.add_parser("setup", help="设置向导")
-    p = sub.add_parser("add", help="添加账号")
+    p = sub.add_parser("setup", help="设置向导（--add：已经设置过，只再加一个号）")
+    p.add_argument("--add", action="store_true", help="只再加一个号，不重新问作息时间")
+    p = sub.add_parser("add", help="添加账号（只写配置；一般用 cduo setup --add，会一并登录）")
     p.add_argument("name")
     p.add_argument("--label")
     p.add_argument("--cli-dir", help="复用已有的 Claude Code 配置目录")
@@ -1977,6 +2594,9 @@ def main():
     p = sub.add_parser("capture", help="把桌面版当前登录保存为该账号的快照")
     p.add_argument("name")
     p.add_argument("--force", action="store_true")
+    p.add_argument("--detached", action="store_true", help=argparse.SUPPRESS)
+    p = sub.add_parser("restore", help="把桌面版登录恢复到某次备份（不填=列出备份；latest=最近一次换号前）")
+    p.add_argument("name", nargs="?")
     p.add_argument("--detached", action="store_true", help=argparse.SUPPRESS)
     p = sub.add_parser("desktop-login", help="存好当前登录后，让桌面版以未登录状态打开（用来登录新账号）")
     p.add_argument("name")
@@ -1995,6 +2615,9 @@ def main():
     p = sub.add_parser("rename", help="改账号的显示名（菜单栏/通知里显示）")
     p.add_argument("name")
     p.add_argument("label")
+    p = sub.add_parser("remove", help="不再管理某个号（桌面版登录快照挪进备份，CLI 登录保留）")
+    p.add_argument("name")
+    p.add_argument("--force", action="store_true", help="桌面版当前登录的就是它也照样移除")
     p = sub.add_parser("agents", help="后台调度和菜单栏：install / uninstall / status / login-on / login-off")
     p.add_argument("action", choices=["install", "uninstall", "status", "login-on", "login-off"])
     p.add_argument("--no-menubar", action="store_true")
@@ -2015,7 +2638,8 @@ def main():
     cmds = {"status": cmd_status, "switch": cmd_switch, "setup": cmd_setup, "add": cmd_add, "login": cmd_login,
             "capture": cmd_capture, "desktop-login": cmd_desktop_login, "ping": cmd_ping, "sync": cmd_sync,
             "tick": cmd_tick, "config": cmd_config, "agents": cmd_agents, "doctor": cmd_doctor,
-            "rename": cmd_rename, "pin-org": cmd_pin_org, "resume": cmd_resume, "login-desktop": cmd_login_desktop}
+            "rename": cmd_rename, "pin-org": cmd_pin_org, "resume": cmd_resume, "login-desktop": cmd_login_desktop,
+            "restore": cmd_restore, "remove": cmd_remove}
     if not args.cmd:
         args = ap.parse_args(["status"])
     try:
