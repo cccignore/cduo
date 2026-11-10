@@ -494,10 +494,15 @@ def write_creds(cli_dir: str, full: dict, where: str) -> None:
         raise RuntimeError("写钥匙串失败: " + p.stderr.strip())
 
 
+def claude_json_path(cli_dir: str) -> pathlib.Path:
+    """claude 记账号身份（oauthAccount）的文件：默认的 ~/.claude 用 ~/.claude.json，其他目录用目录里的 .claude.json。"""
+    if os.path.normpath(cli_dir) == os.path.normpath(str(HOME / ".claude")):
+        return HOME / ".claude.json"
+    return pathlib.Path(cli_dir) / ".claude.json"
+
+
 def cli_identity(cli_dir: str) -> dict:
-    p = pathlib.Path(cli_dir)
-    f = (HOME / ".claude.json") if os.path.normpath(cli_dir) == os.path.normpath(str(HOME / ".claude")) else p / ".claude.json"
-    a = (read_json(f, {}) or {}).get("oauthAccount") or {}
+    a = (read_json(claude_json_path(cli_dir), {}) or {}).get("oauthAccount") or {}
     return {"account_uuid": a.get("accountUuid"), "org_uuid": a.get("organizationUuid"),
             "email": a.get("emailAddress"), "org_name": a.get("organizationName")}
 
@@ -1953,6 +1958,8 @@ def do_switch(cfg: dict, target: str, after_turn: bool = False, relaunch: bool =
 # ───────────────────────── 命令 ─────────────────────────
 
 def cmd_status(args, cfg):
+    if not args.cached:
+        maybe_ensure_tick_agent()
     st = tick(cfg, allow_ping=False) if not args.cached else load_state()
     if args.json:
         sw = st.get("switching")
@@ -2180,23 +2187,139 @@ def cmd_add(args, cfg):
     print(f"✓ 已添加 {args.name}（CLI 目录 {cli_dir}）")
 
 
+# ── CLI 登录走无痕窗口 ──
+# 默认浏览器里已登录的 claude.ai / SSO 账号会顶替要登录的号，所以授权页放到默认浏览器的无痕窗口里打开。
+# claude 打开授权页时优先用 BROWSER 环境变量指定的程序（以 URL 作唯一参数），这里给它一个小脚本。
+
+PRIVATE_OPEN = CDUO / "open-private"
+CHROMIUM_IDS = {"com.google.Chrome", "com.microsoft.edgemac", "com.brave.Browser", "org.chromium.Chromium",
+                "com.vivaldi.Vivaldi", "com.citrolabs.ego.lite"}
+
+
+def private_window_flag(app: str):
+    """这个浏览器打开无痕窗口用的命令行参数；不支持返回 None（比如 Safari）。"""
+    p = pathlib.Path(app)
+    try:
+        with open(p / "Contents/Info.plist", "rb") as f:
+            bid = plistlib.load(f).get("CFBundleIdentifier", "")
+    except Exception:
+        bid = ""
+    if bid.startswith("org.mozilla."):
+        return "--private-window"
+    if bid in CHROMIUM_IDS or any((p / "Contents/Frameworks").glob("* Framework.framework")):
+        return "--incognito"
+    return None
+
+
+PRIVATE_CANDIDATES = ("/Applications/Google Chrome.app", "/Applications/Microsoft Edge.app",
+                      "/Applications/Brave Browser.app", "/Applications/Firefox.app", "/Applications/ego lite.app")
+
+
+def private_browser_helper(cfg: dict | None = None):
+    """生成给 BROWSER 用的脚本：在无痕窗口里打开 URL。返回 (脚本路径, 浏览器名)，做不到返回 None。
+
+    依次试 config 里的 login_browser、默认浏览器、常见的 Chromium/Firefox；Safari 没有命令行开隐私窗口的办法，会被跳过。
+    """
+    import shlex
+    tries = [(cfg or {}).get("login_browser"), default_browser_path()] + list(PRIVATE_CANDIDATES)
+    app = flag = None
+    for t in tries:
+        if t and pathlib.Path(t).exists():
+            flag = private_window_flag(t)
+            if flag:
+                app = t
+                break
+    if not app:
+        return None
+    CDUO.mkdir(parents=True, exist_ok=True)
+    PRIVATE_OPEN.write_text("#!/bin/zsh\n# cduo 生成：在无痕窗口里打开登录链接，免得浏览器里已登录的其他账号顶替\n"
+                            f"exec /usr/bin/open -na {shlex.quote(app)} --args {flag} \"$1\"\n", encoding="utf-8")
+    os.chmod(PRIVATE_OPEN, 0o755)
+    return PRIVATE_OPEN, pathlib.Path(app).stem
+
+
+def _undo_cli_login(cli_dir: str, creds, where, oauth_account) -> None:
+    """把 CLI 目录的凭据和身份恢复到登录前。"""
+    cred_file = pathlib.Path(cli_dir) / ".credentials.json"
+    if creds and where == "file":
+        write_creds(cli_dir, creds, "file")
+    elif creds:
+        cred_file.unlink(missing_ok=True)       # 文件优先于钥匙串，新登录留下的文件会挡住恢复的凭据
+        write_creds(cli_dir, creds, "keychain")
+    else:
+        cred_file.unlink(missing_ok=True)
+        subprocess.run(["security", "delete-generic-password", "-a", os.environ.get("USER", ""),
+                        "-s", kc_service(cli_dir)], capture_output=True)
+    cj = claude_json_path(cli_dir)
+    d = read_json(cj, {}) or {}
+    if oauth_account is None:
+        d.pop("oauthAccount", None)
+    else:
+        d["oauthAccount"] = oauth_account
+    write_json(cj, d)
+
+
+def _login_has_email_flag(claude: str, env: dict) -> bool:
+    """老版本的 claude auth login 没有 --email，带上会直接报错退出。"""
+    try:
+        r = subprocess.run([claude, "auth", "login", "--help"], capture_output=True, text=True, timeout=20, env=env)
+    except Exception:
+        return False
+    return "--email" in (r.stdout or "") + (r.stderr or "")
+
+
 def cli_login(cfg, a) -> bool:
     claude = cfg.get("claude_bin")
     if not claude:
         die("找不到 claude 命令，用 cduo config claude_bin <路径> 设置")
-    print(f"→ 打开浏览器登录【{a['name']}】的 Claude 账号（Claude Code 授权页）…")
-    r = subprocess.run([claude, "auth", "login", "--claudeai"], env=clean_env(cfg, a["cli_dir"]))
+    cli_dir = a["cli_dir"]
+    old_creds, old_where = read_creds(cli_dir)
+    old_oa = (read_json(claude_json_path(cli_dir), {}) or {}).get("oauthAccount")
+    env = clean_env(cfg, cli_dir)
+    who = f"【{a['name']}】" + (f"（{a['email']}）" if a.get("email") else "")
+    helper = private_browser_helper(cfg)
+    if helper:
+        env["BROWSER"] = str(helper[0])
+        print(f"→ 在 {helper[1]} 的无痕窗口里打开 Claude Code 授权页，请用{who}登录。")
+    else:
+        print(f"→ 打开浏览器登录{who}（Claude Code 授权页）。"
+              f"如果浏览器里已经登录着别的号，把授权链接复制到无痕/隐私窗口里打开。")
+    argv = [claude, "auth", "login", "--claudeai"]
+    if a.get("email") and _login_has_email_flag(claude, env):
+        argv += ["--email", a["email"]]     # 授权页预填这个号的邮箱
+    r = subprocess.run(argv, env=env)
     if r.returncode != 0:
         print("登录没有完成")
         return False
-    a.update({k: v for k, v in cli_identity(a["cli_dir"]).items() if v})
+    ident = cli_identity(cli_dir)
+    want = a.get("account_uuid")
+    if want and ident.get("account_uuid") and ident["account_uuid"] != want:
+        other = next((x["name"] for x in cfg["accounts"] if x.get("account_uuid") == ident["account_uuid"]), None)
+        _undo_cli_login(cli_dir, old_creds, old_where, old_oa)
+        log(f"cli login for {a['name']} got another account ({other or ident.get('email')}); undone")
+        print(f"{C['red']}登录的是 {ident.get('email')}" + (f"（{lbl(cfg, other)}）" if other else "")
+              + f"，不是{who}。这次登录已撤销，原来的状态没变。{C['r']}")
+        return False
+    a.update({k: v for k, v in ident.items() if v})
     save_config(cfg)
+    log(f"cli login for {a['name']} ok")
     print(f"{C['g']}✓ CLI 已登录：{a.get('email')} · {a.get('org_name')}{C['r']}")
     return True
 
 
 def cmd_login(args, cfg):
-    cli_login(cfg, get_account(cfg, args.name))
+    a = get_account(cfg, args.name)
+    # 要在浏览器里来回操作，放到「终端」App 里跑，进度和提示看得到
+    if under_claude_process() and open_in_terminal(["login", args.name]):
+        print(f"已在 macOS 的「终端」App 里打开 cduo login {args.name}，请切到那个窗口继续。")
+        return
+    if cli_login(cfg, a):
+        u = fetch_account_usage(cfg, a)
+        update_state(lambda s: s["accounts"].setdefault(a["name"], {}).update(u))
+        if u.get("ok"):
+            print(f"额度已能读取：{lbl(cfg, a['name'])} 已用 {u.get('util') or 0:.0f}%")
+        else:
+            print(f"额度暂时没读到（{u.get('error')}），稍后运行 cduo 再看。")
 
 
 def cmd_ping(args, cfg):
@@ -2247,6 +2370,10 @@ def cmd_config(args, cfg):
     elif key in ("prewarm_enabled", "confirm_switch", "pin_org", "auto_resume"):
         cfg[key] = onoff(val)
     elif key in ("proxy", "claude_bin"):
+        cfg[key] = val
+    elif key == "login_browser":   # cduo login 用来开无痕窗口的浏览器（.app 路径）；留空 = 默认浏览器
+        if val and not private_window_flag(val):
+            die(f"{val} 不是 cduo 认识的、能用命令行开无痕窗口的浏览器（Chrome、Edge、Brave、Firefox 等）")
         cfg[key] = val
     else:
         die(f"不认识的配置项 {key}")
@@ -2382,6 +2509,41 @@ def uninstall_agents() -> None:
         with contextlib.suppress(FileNotFoundError):
             agent_path(label).unlink()
         print(f"✓ 已移除 {label}")
+
+
+def ensure_tick_agent() -> None:
+    """后台调度的 plist 在、launchd 却没加载时，重新加载。
+    比如手动 bootout 暂停后忘了恢复，或者换机迁移时 plist 是登录之后才拷进来的。菜单栏刷新走 status，
+    只读额度、不预热，后台调度一停，预热就悄悄停了，所以在这里补上。要停掉预热请用
+    cduo config prewarm_enabled off 或 cduo agents uninstall；用 launchctl disable 关掉的也不会被重新打开。"""
+    p = agent_path(AGENT_TICK)
+    if not p.exists():
+        return
+    uid = os.getuid()
+    if subprocess.run(["launchctl", "print", f"gui/{uid}/{AGENT_TICK}"], capture_output=True).returncode == 0:
+        return
+    out = subprocess.run(["launchctl", "print-disabled", f"gui/{uid}"], capture_output=True, text=True).stdout
+    if re.search(r'"%s"\s*=>\s*(disabled|true)' % re.escape(AGENT_TICK), out):
+        return   # 用户自己关掉的，不动
+    r = subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", str(p)], capture_output=True, text=True)
+    log(f"tick agent was not loaded; bootstrap -> " + ("ok" if r.returncode == 0 else r.stderr.strip()))
+
+
+def maybe_ensure_tick_agent() -> None:
+    """最多 10 分钟检查一次（status 被菜单栏频繁调用）。"""
+    if FAKE_DESKTOP:      # 测试里不碰真实的 launchd
+        return
+    mark = CDUO / ".agent_check"
+    try:
+        if now() - mark.stat().st_mtime < 600:
+            return
+    except FileNotFoundError:
+        pass
+    try:
+        mark.touch()
+        ensure_tick_agent()
+    except Exception as e:
+        log(f"ensure tick agent failed: {e}")
 
 
 def cmd_agents(args, cfg):
@@ -2527,6 +2689,66 @@ def cmd_setup(args, cfg):
     cmd_status(argparse.Namespace(json=False, cached=False), cfg)
 
 
+# ── SSO 登录：桌面版用系统默认浏览器打开 SSO 登录页（ASWebAuth） ──
+# 默认浏览器里如果还登录着另一个同校/同组织的账号，SSO 会直接用那个账号放行，Claude 就登录成了那个号。
+
+SETTINGS_DEFAULT_BROWSER = "x-apple.systempreferences:com.apple.Desktop-Settings.extension"
+
+
+def default_browser_path() -> str | None:
+    """系统默认网页浏览器的 .app 路径（读不到返回 None）。"""
+    js = ('ObjC.import("AppKit");'
+          'var u=$.NSWorkspace.sharedWorkspace.URLForApplicationToOpenURL($.NSURL.URLWithString("https://claude.ai"));'
+          'u.isNil()?"":u.path.js')
+    try:
+        p = subprocess.run(["osascript", "-l", "JavaScript", "-e", js],
+                           capture_output=True, text=True, timeout=10).stdout.strip()
+    except Exception:
+        return None
+    return p or None
+
+
+def default_browser_name() -> str | None:
+    p = default_browser_path()
+    return pathlib.Path(p).stem if p else None
+
+
+def sso_peers(cfg: dict, a: dict) -> list:
+    """和 a 同邮箱域名或同组织（多半走同一个 SSO）的其他账号名。"""
+    dom = (a.get("email") or "").rpartition("@")[2].lower()
+    out = []
+    for x in cfg["accounts"]:
+        if x["name"] == a["name"]:
+            continue
+        xd = (x.get("email") or "").rpartition("@")[2].lower()
+        if (dom and xd == dom) or (a.get("org_uuid") and x.get("org_uuid") == a.get("org_uuid")):
+            out.append(x["name"])
+    return out
+
+
+def sso_browser_check(cfg: dict, a: dict) -> str | None:
+    """登录前提醒默认浏览器的事，并可打开设置让用户换。返回原来的默认浏览器名（用来登录后提醒换回去）。"""
+    peers = sso_peers(cfg, a)
+    if not peers:
+        return None
+    name0 = default_browser_name()
+    shown = name0 or "默认浏览器"
+    others = "、".join(lbl(cfg, n) for n in peers)
+    print(f"\n{C['y']}注意：{C['r']}Claude 会用默认浏览器（{shown}）打开 SSO 登录页。"
+          f"如果 {shown} 里还登录着【{others}】的账号，SSO 会直接放行，Claude 就会登录成那个号。")
+    print(f"办法：临时把默认浏览器换成没登录过这些账号的浏览器（一般是 Safari），登录完再换回来；"
+          f"或者先在 {shown} 里退出那个账号。")
+    if ask("现在打开「默认网页浏览器」设置？(y/n)", "y") == "y":
+        subprocess.run(["open", SETTINGS_DEFAULT_BROWSER], capture_output=True)
+        input("在「桌面与程序坞 → 默认网页浏览器」里换好后按回车 …")
+        name1 = default_browser_name()
+        if name1 and name1 == name0:
+            print(f"默认浏览器还是 {name1}。如果已经在 {name1} 里退出了那个账号，可以直接继续。")
+        elif name1:
+            print(f"默认浏览器现在是 {name1}。")
+    return name0
+
+
 def desktop_login_flow(cfg: dict, a: dict, st: dict) -> None:
     """让桌面版登录某个号并保存快照（之后就能一键切换到它）。"""
     uid = desktop_account_uuid()
@@ -2535,6 +2757,7 @@ def desktop_login_flow(cfg: dict, a: dict, st: dict) -> None:
         cmd_capture(argparse.Namespace(name=a["name"], force=False, detached=False), cfg)
         return
     print(f"\n接下来在桌面版登录【{a['name']}】（{a.get('email') or '它的账号'}）。")
+    browser0 = sso_browser_check(cfg, a)
     cur = current_desktop_profile(cfg, st)
     if uid and not cur:
         print("桌面版当前登录的账号不属于 Cduo 管理的号。")
@@ -2549,10 +2772,25 @@ def desktop_login_flow(cfg: dict, a: dict, st: dict) -> None:
         if uid2 and (not a.get("account_uuid") or uid2 == a["account_uuid"]):
             break
         if uid2 and a.get("account_uuid") and uid2 != a["account_uuid"]:
-            print(f"Claude 里登录的不是【{a['name']}】（{a.get('email')}）。请在 Claude 里换成这个账号再按回车。")
+            other = next((x["name"] for x in cfg["accounts"] if x.get("account_uuid") == uid2), None)
+            print(f"Claude 里登录的不是【{a['name']}】（{a.get('email')}）"
+                  + (f"，而是【{lbl(cfg, other)}】" if other else "") + "。")
+            if other and other in sso_peers(cfg, a):
+                print(f"多半是默认浏览器（{default_browser_name() or '?'}）里还登录着【{lbl(cfg, other)}】的 SSO 账号。"
+                      f"换个默认浏览器，或在浏览器里退出那个账号后再试。")
+            # 登进来的号已经有快照，丢掉这次登录没有损失，可以直接重来
+            if other and has_profile(other) and ask("让 Claude 再以未登录状态打开一次？(y/n)", "y") == "y":
+                _foreign_login_reset(cfg)
+                continue
+            print("请在 Claude 里换成这个账号再按回车。")
         else:
             print("还没检测到这个账号的登录（如果刚登录，等几秒再按回车）。")
     cmd_capture(argparse.Namespace(name=a["name"], force=False, detached=False), cfg)
+    now_browser = default_browser_name()
+    if browser0 and now_browser and now_browser != browser0:
+        print(f"\n{C['y']}登录已保存，可以把默认浏览器换回 {browser0} 了。{C['r']}")
+        if ask("现在打开「默认网页浏览器」设置？(y/n)", "y") == "y":
+            subprocess.run(["open", SETTINGS_DEFAULT_BROWSER], capture_output=True)
 
 
 def cmd_login_desktop(args, cfg):
