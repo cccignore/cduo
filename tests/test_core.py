@@ -337,6 +337,154 @@ ok(any(p.name.endswith("before-restore") for p in logins), "the newest real back
 exited, out, err = capture(m.cmd_status, NS(json=True, cached=True), cfg)
 ok(not exited and json.loads(out)["accounts"][0]["name"] == "A", "status --json still works")
 
+# ───── 16. cduo login：授权页开在无痕窗口里 ─────
+import plistlib, types
+def fake_app(name, bid, framework=None):
+    app = T/"apps"/f"{name}.app"
+    (app/"Contents").mkdir(parents=True, exist_ok=True)
+    with open(app/"Contents/Info.plist", "wb") as f:
+        plistlib.dump({"CFBundleIdentifier": bid}, f)
+    if framework:
+        (app/"Contents/Frameworks"/framework).mkdir(parents=True)
+    return str(app)
+chrome, fox = fake_app("Chrome", "com.google.Chrome"), fake_app("Firefox", "org.mozilla.firefox")
+safari = fake_app("Safari", "com.apple.Safari")
+other = fake_app("Other", "com.example.browser", "Other Framework.framework")
+flags = [m.private_window_flag(x) for x in (chrome, fox, safari, other)]
+ok(flags == ["--incognito", "--private-window", None, "--incognito"], f"private-window flag per browser: {flags}")
+real_dbp, real_cands = m.default_browser_path, m.PRIVATE_CANDIDATES
+m.default_browser_path = lambda: safari
+m.PRIVATE_CANDIDATES = (str(T/"apps"/"Missing.app"), fox)
+helper = m.private_browser_helper({})
+ok(helper and helper[1] == "Firefox" and "--private-window" in helper[0].read_text() and os.access(helper[0], os.X_OK),
+   "default browser can't open a private window (Safari) → falls back to one that can")
+helper = m.private_browser_helper({"login_browser": chrome})
+ok(helper and helper[1] == "Chrome" and "--incognito" in helper[0].read_text(), "login_browser in config wins")
+m.PRIVATE_CANDIDATES = ()
+ok(m.private_browser_helper({}) is None, "no browser that can open a private window → None")
+
+# ───── 17. cduo login：登成别的号会撤销，原来的登录不变 ─────
+ACC_B = cfg["accounts"][1]
+ACC_B["email"] = "b@example.com"
+fake_claude = T/"claude"
+fake_claude.write_text(f"""#!/bin/sh
+if [ "$3" = "--help" ]; then echo "  --email <email>  Pre-populate email address"; exit 0; fi
+echo "$BROWSER $*" > "{T}/claude-args"
+as=$(cat "{T}/login-as")
+printf '{{"claudeAiOauth":{{"accessToken":"new-%s","refreshToken":"r","expiresAt":9999999999999}}}}' "$as" \\
+  > "$CLAUDE_CONFIG_DIR/.credentials.json"
+printf '{{"oauthAccount":{{"accountUuid":"%s","emailAddress":"%s@example.com","organizationUuid":"{ORG}"}}}}' "$as" "$as" \\
+  > "$CLAUDE_CONFIG_DIR/.claude.json"
+""")
+os.chmod(fake_claude, 0o755)
+cfg["claude_bin"] = str(fake_claude)
+m.default_browser_path = lambda: chrome
+cj_b = H/"cli"/"B"/".claude.json"
+cj_b.unlink(missing_ok=True)
+creds("B", 3600, "tokB")
+(T/"login-as").write_text(UA)                      # 浏览器里还登录着 A：授权给了 A
+exited, out, err = capture(m.cli_login, cfg, ACC_B)
+args_seen = (T/"claude-args").read_text()
+ok(m.read_creds(ACC_B["cli_dir"])[0]["claudeAiOauth"]["accessToken"] == "tokB" and "oauthAccount" not in
+   (json.loads(cj_b.read_text()) if cj_b.exists() else {}) and "已撤销" in out,
+   "logged in as the wrong account → undone, old credentials kept")
+ok(args_seen.startswith(str(m.PRIVATE_OPEN)) and "--email b@example.com" in args_seen,
+   f"claude gets the private-window helper as BROWSER and the email prefilled: {args_seen.strip()}")
+(T/"login-as").write_text(UB)
+exited, out, err = capture(m.cli_login, cfg, ACC_B)
+ok(m.read_creds(ACC_B["cli_dir"])[0]["claudeAiOauth"]["accessToken"] == "new-" + UB and "CLI 已登录" in out,
+   "logged in as the right account → kept")
+fake_claude.write_text(fake_claude.read_text().replace("--email <email>", "--sso"))   # 老版本 claude 没有 --email
+exited, out, err = capture(m.cli_login, cfg, ACC_B)
+ok("--email" not in (T/"claude-args").read_text(), "older claude without --email → not passed")
+m.default_browser_path, m.PRIVATE_CANDIDATES = real_dbp, real_cands
+cfg["claude_bin"] = None
+ACC_B.pop("email", None)
+m.save_config(cfg)
+
+# ───── 18. 后台调度的 plist 在、却没被 launchd 加载 → status 会补上 ─────
+lc = {"loaded": False, "disabled": False}
+calls = []
+def fake_run(argv, **kw):
+    calls.append(argv[:2])
+    rc, outp = 0, ""
+    if argv[:2] == ["launchctl", "print"]:
+        rc = 0 if lc["loaded"] else 113
+    elif argv[:2] == ["launchctl", "print-disabled"]:
+        outp = f'\t"com.cduo.tick" => {"disabled" if lc["disabled"] else "enabled"}\n'
+    elif argv[:2] == ["launchctl", "bootstrap"]:
+        lc["loaded"] = True
+    return types.SimpleNamespace(returncode=rc, stdout=outp, stderr="")
+real_sp, real_ap = m.subprocess, m.agent_path
+m.subprocess = types.SimpleNamespace(run=fake_run)
+m.agent_path = lambda label: T/"agents"/f"{label}.plist"
+m.ensure_tick_agent()
+ok(calls == [], "no plist (agents never installed or uninstalled) → nothing to do")
+(T/"agents").mkdir(exist_ok=True); (T/"agents"/"com.cduo.tick.plist").write_text("x")
+lc["disabled"] = True
+m.ensure_tick_agent()
+ok(["launchctl", "bootstrap"] not in calls, "disabled with launchctl disable → left alone")
+lc["disabled"], calls[:] = False, []
+m.ensure_tick_agent()
+ok(["launchctl", "bootstrap"] in calls and lc["loaded"], "plist there but not loaded → bootstrapped")
+calls[:] = []
+m.ensure_tick_agent()
+ok(calls == [["launchctl", "print"]], "already loaded → only checked")
+calls[:] = []
+m.maybe_ensure_tick_agent()
+ok(calls == [], "test mode (CDUO_FAKE_DESKTOP) never touches launchd")
+m.FAKE_DESKTOP = False
+(H/".agent_check").unlink(missing_ok=True)
+m.maybe_ensure_tick_agent(); first = len(calls)
+m.maybe_ensure_tick_agent()
+ok(first == 1 and len(calls) == 1, "status checks the agent at most once every 10 minutes")
+m.FAKE_DESKTOP = True
+m.subprocess, m.agent_path = real_sp, real_ap
+
+# ───── 19. 预热成功后，额度接口要过十几秒才显示新窗口：别显示成「未开始计时」 ─────
+def usage(resets=None, util=0.0):
+    return {"fetched": time.time(), "ok": True, "no5h": False, "util": util, "resets_at": resets, "error": None}
+t0 = time.time()
+ok(m.est_resets(dict(usage(), last_ping=t0 - 120, last_ping_ok=True)) == t0 - 120 + m.WINDOW,
+   "pinged 2 min ago, API shows no window yet → estimated from the ping")
+ok(m.est_resets(dict(usage(), last_ping=t0 - 20 * 60, last_ping_ok=True)) is None,
+   "pinged 20 min ago and still no window → really idle (will be pinged again)")
+ok(m.est_resets(dict(usage(), last_ping=t0 - 120, last_ping_ok=False)) is None, "failed ping → not counted")
+ok(m.shown_resets({"ok": False, "error": "x", "last_ping": t0 - 120}) is None, "API error → no time shown")
+
+pings, b_calls = [], {"n": 0, "show_after": 2}
+def lagging_fetch(c, a):
+    if a["name"] == "A":
+        return usage(time.time() + 2 * 3600, 40.0)         # A 的窗口还剩 2 小时：B 该开始计时了
+    if not pings:
+        return usage()
+    b_calls["n"] += 1
+    return usage(pings[0] + m.WINDOW) if b_calls["n"] > b_calls["show_after"] else usage()
+real_fetch, real_ping, real_active, real_dry, real_poll = (m.fetch_account_usage, m.do_ping, m.in_active_hours,
+                                                          m.DRY_PING, m.PING_POLL)
+m.fetch_account_usage = lagging_fetch
+m.do_ping = lambda c, a, why: pings.append(time.time()) or True
+m.in_active_hours = lambda c, t=None: True
+m.DRY_PING, m.PING_POLL = False, (0, 0, 0, 0)
+cfg["prewarm_enabled"] = True
+m.save_state({"accounts": {}, "desktop_current": "A"})
+st = m.tick(cfg)
+ok(len(pings) == 1 and m.window_running(st["accounts"]["B"]) and "都在计时" in st["next_ping"]["why"],
+   f"after the ping, tick polls until the new window shows up: {b_calls['n']} fetches, {st['next_ping']['why']}")
+pings.clear(); b_calls.update(n=0, show_after=99)              # 接口一直没跟上
+m.save_state({"accounts": {}, "desktop_current": "A"})
+st = m.tick(cfg)
+exited, out, err = capture(m.cmd_status, NS(json=True, cached=True), cfg)
+cardB = next(x for x in json.loads(out)["accounts"] if x["name"] == "B")
+ok(len(pings) == 1 and "都在计时" in st["next_ping"]["why"] and cardB["running"] and cardB["resets_at"],
+   "API still lagging → the card shows an estimated reset instead of 「未开始计时」, no 「现在开始计时」")
+st = m.tick(cfg)
+ok(len(pings) == 1, "and it isn't pinged again on the next tick")
+m.fetch_account_usage, m.do_ping, m.in_active_hours, m.DRY_PING, m.PING_POLL = (real_fetch, real_ping, real_active,
+                                                                               real_dry, real_poll)
+cfg["prewarm_enabled"] = False
+m.save_config(cfg)
+
 shutil.rmtree(T, ignore_errors=True)
 print(f"\n{'全部通过' if not FAILS else f'{len(FAILS)} 项失败'}")
 sys.exit(1 if FAILS else 0)

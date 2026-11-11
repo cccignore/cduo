@@ -130,6 +130,7 @@ m.desktop_login_flow = lambda c, a, s: logins.append(a["name"])
 installed = []
 m.install_agents = lambda *a, **k: installed.append(True)
 m.cmd_status = lambda *a, **k: None
+m.find_claude_bin = lambda: "/usr/bin/true"           # 没装 claude 的机器（比如 CI）上，向导会先问 claude 路径
 (T/"agents").mkdir(); (T/"agents"/"com.cduo.tick.plist").write_text("x")
 m.agent_path = lambda label: T/"agents"/f"{label}.plist"   # 后台调度已经装过
 exited, out, err = capture(m.cmd_setup, NS(add=True), cfg)

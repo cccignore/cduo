@@ -107,12 +107,14 @@ cduo                       # 看额度
 cduo switch [名字]          # 换号（不带名字：换到还有额度、最先刷新的号）
 cduo setup --add           # 再加一个号
 cduo remove 名字            # 不再管理某个号
+cduo login 名字             # 重新给某个号授权查额度（在无痕窗口里打开授权页）
 cduo config auto_switch off|notify|idle   # idle = 全自动
 cduo config auto_resume on|off             # 被额度打断的任务是否自动续上
 cduo resume test           # 测试自动续上：往你最新建的会话里发一句无害的测试消息
 cduo config work_hours 10:00-01:00
 cduo rename neu1 学校号
 cduo doctor                # 自检（含 Claude 版本、文件结构检查、备份数量）
+cduo agents status         # 后台调度有没有在跑
 cduo restore               # 列出桌面版登录备份
 cduo restore latest        # 恢复到最近一次换号前的登录
 ```
@@ -134,6 +136,10 @@ cduo restore latest        # 恢复到最近一次换号前的登录
 ## 常见问题
 
 - **提示「过程中要重启 Claude，不能在 Claude 里面运行」**：你是在 Claude 自己的终端面板或对话里运行的 `cduo setup`。设置时要重启 Claude，会把它自己也关掉，所以 Cduo 会自动在 macOS 的「终端」App 里打开设置向导，切到那个窗口继续就行。
+- **登录某个号，结果登成了另一个号**：几个号属于同一个组织、走同一个单点登录（SSO）时容易出现。授权页在默认浏览器里打开，浏览器里还登录着另一个号，SSO 就直接按那个号放行了。
+  - 额度一栏显示「未登录」：运行 `cduo login 名字`。授权页会在无痕窗口里打开并预填这个号的邮箱，不受浏览器里已登录账号的影响；登成别的号会自动撤销，原来的登录不变。默认浏览器是 Safari 时，会改用装了的 Chrome、Edge、Brave 或 Firefox，也可以用 `cduo config login_browser /Applications/某浏览器.app` 指定。
+  - 桌面版的登录由 Claude 自己用默认浏览器打开，没法强制无痕。`cduo login-desktop 名字` 会提前提醒，可以临时把默认浏览器换成没登录过这些号的浏览器，登录保存后再换回来。换号时 Cduo 会把桌面版的最新登录存回快照，所以这一步一般只在第一次设置时做。
+- **某个号一直显示「满额 · 未开始计时」**：预热由后台调度每 5 分钟做一次，菜单栏刷新只读额度。运行 `cduo agents status`，tick 显示「未安装」就是后台调度没在跑（比如手动暂停后没恢复、换机迁移后还没重新登录）。菜单栏刷新时会自动把它重新加载上，也可以手动运行 `cduo agents install`。想停掉预热请用 `cduo config prewarm_enabled off`。
 - **终端里提示 `command not found: cduo`**：新开一个终端窗口再试（安装时已把 `~/.local/bin` 加进 PATH）；或者直接点菜单栏 Cduo →「开始设置」。
 
 ## 卸载
