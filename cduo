@@ -58,6 +58,8 @@ WINDOW = 5 * 3600
 RESUME_CHECK_WAIT = float(os.environ.get("CDUO_RESUME_CHECK_WAIT", "10"))  # 发出续上的话后，最多再等几秒核对
 FAKE_DESKTOP = os.environ.get("CDUO_FAKE_DESKTOP") == "1"   # 测试用：不真的退出/启动 App
 DRY_PING = os.environ.get("CDUO_DRY_PING") == "1"           # 测试用：不真的发预热
+PING_SETTLE = 10 * 60   # 预热成功后这么久内，额度接口还没显示新窗口，就按预热时间估算
+PING_POLL = (5, 5, 10, 10)   # 预热成功后再查几次额度（秒）：接口要过十几秒才显示新窗口
 
 DEFAULT_CONFIG = {
     "claude_bin": None,
@@ -630,12 +632,27 @@ def window_running(u: dict) -> bool:
 
 
 def est_resets(u: dict):
-    """窗口重置时间；接口拿不到时，用最近一次成功预热时间估算，避免反复预热。"""
-    if u and u.get("ok") and not u.get("no5h"):
-        return u["resets_at"] if window_running(u) else None
+    """窗口重置时间；接口拿不到时，用最近一次成功预热时间估算，避免反复预热。
+
+    刚预热成功、接口还没显示新窗口（要等十几秒）时，也先按预热时间估算，
+    免得菜单栏在这几分钟里显示「未开始计时」「现在开始计时」。
+    """
     lp = (u or {}).get("last_ping") if (u or {}).get("last_ping_ok", True) else None
+    if u and u.get("ok") and not u.get("no5h"):
+        if window_running(u):
+            return u["resets_at"]
+        return lp + WINDOW if lp and now() - lp < PING_SETTLE else None
     if lp and lp + WINDOW > now():
         return lp + WINDOW
+    return None
+
+
+def shown_resets(u: dict):
+    """显示给人看的刷新时间：以接口为准；刚预热、接口还没跟上时用估算值。接口出错时不显示。"""
+    if window_running(u):
+        return u["resets_at"]
+    if u and u.get("ok") and not u.get("no5h"):
+        return est_resets(u)
     return None
 
 
@@ -1462,6 +1479,11 @@ def tick(cfg: dict, verbose: bool = False, allow_ping: bool = True) -> dict:
                 if okp:
                     pinged = acct["name"]
                 nu = fetch_account_usage(cfg, acct)
+                for wait in (PING_POLL if okp and not DRY_PING else ()):
+                    if not nu.get("ok") or nu.get("no5h") or window_running(nu):
+                        break
+                    time.sleep(wait)        # 接口要过十几秒才显示新窗口，再查一次
+                    nu = fetch_account_usage(cfg, acct)
                 nu["last_ping"], nu["last_ping_ok"] = now(), okp
                 st["accounts"][acct["name"]] = nu
                 acct, why, due = plan_pings(cfg, st)
@@ -1990,8 +2012,8 @@ def cmd_status(args, cfg):
             u = st["accounts"].get(a["name"], {})
             out["accounts"].append({"name": a["name"], "label": a.get("label") or a["name"],
                                     "email": a.get("email"),
-                                    "util": effective_util(u), "running": window_running(u),
-                                    "resets_at": u.get("resets_at") if window_running(u) else None,
+                                    "util": effective_util(u), "running": bool(shown_resets(u)),
+                                    "resets_at": shown_resets(u),
                                     "error": u.get("error"), "has_profile": has_profile(a["name"]),
                                     "desktop_current": st.get("desktop_current") == a["name"],
                                     "last_ping": u.get("last_ping")})
@@ -2010,8 +2032,9 @@ def cmd_status(args, cfg):
         else:
             col = C["g"] if eu < 70 else (C["y"] if eu < 95 else C["red"])
             filled = int(round(eu / 10))
-            when = (f"{hhmm(u['resets_at'])} 刷新额度（还有 {dur(u['resets_at'] - now())}）" if window_running(u)
-                    else "满额，还没开始计时")
+            sr = shown_resets(u)
+            when = (f"{hhmm(sr)} 刷新额度（还有 {dur(sr - now())}）" + ("" if window_running(u) else "（刚开始计时，估算）")
+                    if sr else "满额，还没开始计时")
             bar = f"{col}{'█' * filled}{'░' * (10 - filled)} 已用 {eu:3.0f}%{C['r']}  {when}"
         prof = "" if has_profile(a["name"]) else f"  {C['y']}(还没在桌面版登录：cduo login-desktop {a['name']}){C['r']}"
         print(f" {mark} {(a.get('label') or a['name']):<8} {bar}{prof}")

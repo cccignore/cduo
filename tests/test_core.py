@@ -441,6 +441,50 @@ ok(first == 1 and len(calls) == 1, "status checks the agent at most once every 1
 m.FAKE_DESKTOP = True
 m.subprocess, m.agent_path = real_sp, real_ap
 
+# ───── 19. 预热成功后，额度接口要过十几秒才显示新窗口：别显示成「未开始计时」 ─────
+def usage(resets=None, util=0.0):
+    return {"fetched": time.time(), "ok": True, "no5h": False, "util": util, "resets_at": resets, "error": None}
+t0 = time.time()
+ok(m.est_resets(dict(usage(), last_ping=t0 - 120, last_ping_ok=True)) == t0 - 120 + m.WINDOW,
+   "pinged 2 min ago, API shows no window yet → estimated from the ping")
+ok(m.est_resets(dict(usage(), last_ping=t0 - 20 * 60, last_ping_ok=True)) is None,
+   "pinged 20 min ago and still no window → really idle (will be pinged again)")
+ok(m.est_resets(dict(usage(), last_ping=t0 - 120, last_ping_ok=False)) is None, "failed ping → not counted")
+ok(m.shown_resets({"ok": False, "error": "x", "last_ping": t0 - 120}) is None, "API error → no time shown")
+
+pings, b_calls = [], {"n": 0, "show_after": 2}
+def lagging_fetch(c, a):
+    if a["name"] == "A":
+        return usage(time.time() + 2 * 3600, 40.0)         # A 的窗口还剩 2 小时：B 该开始计时了
+    if not pings:
+        return usage()
+    b_calls["n"] += 1
+    return usage(pings[0] + m.WINDOW) if b_calls["n"] > b_calls["show_after"] else usage()
+real_fetch, real_ping, real_active, real_dry, real_poll = (m.fetch_account_usage, m.do_ping, m.in_active_hours,
+                                                          m.DRY_PING, m.PING_POLL)
+m.fetch_account_usage = lagging_fetch
+m.do_ping = lambda c, a, why: pings.append(time.time()) or True
+m.in_active_hours = lambda c, t=None: True
+m.DRY_PING, m.PING_POLL = False, (0, 0, 0, 0)
+cfg["prewarm_enabled"] = True
+m.save_state({"accounts": {}, "desktop_current": "A"})
+st = m.tick(cfg)
+ok(len(pings) == 1 and m.window_running(st["accounts"]["B"]) and "都在计时" in st["next_ping"]["why"],
+   f"after the ping, tick polls until the new window shows up: {b_calls['n']} fetches, {st['next_ping']['why']}")
+pings.clear(); b_calls.update(n=0, show_after=99)              # 接口一直没跟上
+m.save_state({"accounts": {}, "desktop_current": "A"})
+st = m.tick(cfg)
+exited, out, err = capture(m.cmd_status, NS(json=True, cached=True), cfg)
+cardB = next(x for x in json.loads(out)["accounts"] if x["name"] == "B")
+ok(len(pings) == 1 and "都在计时" in st["next_ping"]["why"] and cardB["running"] and cardB["resets_at"],
+   "API still lagging → the card shows an estimated reset instead of 「未开始计时」, no 「现在开始计时」")
+st = m.tick(cfg)
+ok(len(pings) == 1, "and it isn't pinged again on the next tick")
+m.fetch_account_usage, m.do_ping, m.in_active_hours, m.DRY_PING, m.PING_POLL = (real_fetch, real_ping, real_active,
+                                                                               real_dry, real_poll)
+cfg["prewarm_enabled"] = False
+m.save_config(cfg)
+
 shutil.rmtree(T, ignore_errors=True)
 print(f"\n{'全部通过' if not FAILS else f'{len(FAILS)} 项失败'}")
 sys.exit(1 if FAILS else 0)
