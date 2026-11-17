@@ -132,7 +132,31 @@ struct Acct: Identifiable, Equatable {
     var name = "", label = "", email = ""
     var util: Double? = nil, running = false, resetsAt: Double? = nil
     var error: String? = nil, hasProfile = false, current = false
+    var errorKind: String? = nil          // login / network / denied / ratelimit / server / other
+    var staleUtil: Double? = nil, okAt: Double? = nil   // 读不到时：上次读到的数、什么时候读到的
+    var weekly: Double? = nil, eta: Double? = nil       // 本周已用、按现在的速度几点用完
+    var prewarm = true
+    var pingFailKind: String? = nil, pingRetryAt: Double? = nil
     var display: String { label.isEmpty ? name : label }
+}
+
+/// 「12 分钟」「2 小时」：过去了多久
+func ago(_ ts: Double?) -> String {
+    guard let ts = ts else { return "" }
+    let mins = max(Int((Date().timeIntervalSince1970 - ts) / 60), 1)
+    return mins < 60 ? "\(mins) 分钟" : "\(mins / 60) 小时"
+}
+
+/// 出错类型给人看的说法
+func errorText(_ kind: String?) -> String {
+    switch kind {
+    case "login": return "登录失效，需要重新登录"
+    case "network": return "网络/代理连不上"
+    case "denied": return "请求被拒（多半是代理）"
+    case "ratelimit": return "接口限流，稍后自动再查"
+    case "server": return "Anthropic 服务端出错"
+    default: return "额度读取失败"
+    }
 }
 
 struct Event: Identifiable {
@@ -174,10 +198,26 @@ final class Model: ObservableObject {
     @Published var waitUntil: Double? = nil
     @Published var waitCount = 0
     @Published var resuming: String? = nil
+    @Published var recUrgent = false
+    @Published var recKind = ""
+    @Published var netDownSince: Double? = nil
+    @Published var notifyExpiring = false
     var onSwitchError: ((String) -> Void)?
 
-    /// 当前号快用完、正在等刷新、或有被打断的任务：查得勤一点
-    var hot: Bool { (current?.util ?? 0) >= 85 || waitUntil != nil || !interrupted.isEmpty }
+    /// 当前号按现在的速度 1 小时内会用完（而且在刷新之前）：返回预计时间
+    var etaSoon: Double? {
+        guard let e = current?.eta, e - Date().timeIntervalSince1970 <= 3600 else { return nil }
+        return e
+    }
+
+    /// 需要你动手的时候，菜单栏图标后面才亮橙点：快用完、被打断、要登录、预计很快用完。
+    /// 「另一个号快到期，可以先用它」不算，只在面板里显示
+    var actionable: Bool {
+        (recAction == "switch" && recUrgent) || recAction == "need_login" || !interrupted.isEmpty || etaSoon != nil
+    }
+
+    /// 当前号快用完、正在等刷新、有被打断的任务、或预计很快用完：查得勤一点
+    var hot: Bool { (current?.util ?? 0) >= 85 || waitUntil != nil || !interrupted.isEmpty || etaSoon != nil }
 
     func display(_ n: String?) -> String {
         guard let n = n else { return "?" }
@@ -203,7 +243,7 @@ final class Model: ObservableObject {
         for a in accts where a.running {
             if let r = a.resetsAt { ev.append(Event(time: r, icon: "arrow.clockwise", text: "\(a.display) 额度刷新")) }
         }
-        if prewarm, let at = nextAt, let n = nextName {
+        if prewarm, netDownSince == nil, let at = nextAt, let n = nextName {   // 断网时预热暂停，不列出来
             ev.append(Event(time: at, icon: "play.fill", text: "\(display(n)) 开始计时"))
         }
         return ev.sorted { $0.time < $1.time }.prefix(3).map { $0 }
@@ -224,18 +264,26 @@ final class Model: ObservableObject {
               let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
         loaded = true
         accts = (j["accounts"] as? [[String: Any]] ?? []).map {
-            Acct(name: $0["name"] as? String ?? "?", label: $0["label"] as? String ?? "",
-                 email: $0["email"] as? String ?? "",
-                 util: $0["util"] as? Double, running: $0["running"] as? Bool ?? false,
-                 resetsAt: $0["resets_at"] as? Double, error: $0["error"] as? String,
-                 hasProfile: $0["has_profile"] as? Bool ?? false, current: $0["desktop_current"] as? Bool ?? false)
+            let pf = $0["ping_fail"] as? [String: Any]
+            return Acct(name: $0["name"] as? String ?? "?", label: $0["label"] as? String ?? "",
+                        email: $0["email"] as? String ?? "",
+                        util: $0["util"] as? Double, running: $0["running"] as? Bool ?? false,
+                        resetsAt: $0["resets_at"] as? Double, error: $0["error"] as? String,
+                        hasProfile: $0["has_profile"] as? Bool ?? false, current: $0["desktop_current"] as? Bool ?? false,
+                        errorKind: $0["error_kind"] as? String, staleUtil: $0["stale_util"] as? Double,
+                        okAt: $0["ok_at"] as? Double, weekly: $0["weekly_util"] as? Double, eta: $0["eta"] as? Double,
+                        prewarm: $0["prewarm"] as? Bool ?? true,
+                        pingFailKind: pf?["kind"] as? String, pingRetryAt: pf?["retry_at"] as? Double)
         }
+        netDownSince = j["net_down_since"] as? Double
         configured = !accts.isEmpty
         version = j["version"] as? String ?? ""
         let rec = j["recommend"] as? [String: Any] ?? [:]
         recAction = rec["action"] as? String ?? ""
         recTarget = rec["target"] as? String
         recReason = rec["reason"] as? String ?? ""
+        recUrgent = rec["urgent"] as? Bool ?? false
+        recKind = rec["kind"] as? String ?? ""
         let np = j["next_ping"] as? [String: Any] ?? [:]
         nextWhy = np["why"] as? String ?? ""
         nextAt = np["at"] as? Double
@@ -257,6 +305,7 @@ final class Model: ObservableObject {
             loginItem = s["login_item"] as? Bool ?? true
             pinOrg = s["pin_org"] as? Bool ?? true
             autoResume = s["auto_resume"] as? Bool ?? true
+            notifyExpiring = s["notify_expiring"] as? Bool ?? false
             pinReady = s["pin_org_ready"] as? Bool ?? true
             if let o = (s["org_names"] as? [String])?.first { orgName = o.components(separatedBy: " - ").first ?? o }
             if let w = s["work_hours"] as? [String: Any] {
@@ -342,11 +391,32 @@ struct AccountCard: View {
     @ObservedObject var m: Model
     let a: Acct
     var recommended: Bool { (m.recAction == "switch" || m.recAction == "need_login") && m.recTarget == a.name }
+    /// 需要你动手的推荐（快用完、要登录）用橙色强调；「快到期，可以先用」只轻轻提示一下
+    var urgent: Bool { recommended && (m.recUrgent || m.recAction == "need_login") }
 
     var subtitle: String {
-        if a.util == nil { return "额度读取失败" }
+        if a.util == nil { return errorText(a.errorKind) }
         if !a.hasProfile && !a.current { return "还没在桌面版登录" }
         return a.running ? "\(hhmm(a.resetsAt)) 刷新" : "满额 · 未开始计时"
+    }
+
+    /// 第二行小字：按重要程度只显示一条
+    var detail: (String, Color)? {
+        if let e = a.eta { return ("按现在的速度约 \(hhmm(e)) 用完", .orange) }
+        if let k = a.pingFailKind, a.util != nil {
+            let why = ["network": "网络", "denied": "请求被拒", "ratelimit": "限流", "login": "要登录"][k] ?? "出错"
+            return ("预热失败（\(why)），" + (a.pingRetryAt.map { "\(hhmm($0)) 再试" } ?? "稍后再试"), .orange)
+        }
+        if a.util == nil, a.staleUtil != nil, let t = a.okAt { return ("显示的是 \(ago(t))前的数据", .secondary) }
+        return nil
+    }
+
+    /// 第三行小字：周额度、是否参与预热
+    var extra: String? {
+        var parts: [String] = []
+        if let w = a.weekly, w >= 1 { parts.append("本周已用 \(Int(w.rounded()))%") }
+        if !a.prewarm { parts.append("不参与预热") }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
     var body: some View {
@@ -355,10 +425,19 @@ struct AccountCard: View {
                 Text(a.display).font(.system(size: 13, weight: .semibold)).lineLimit(1)
                 Spacer(minLength: 4)
                 if a.current { Pill(text: "使用中") }
-                else if recommended { Pill(text: "推荐", color: .orange) }
+                else if urgent { Pill(text: "推荐", color: .orange) }
+                else if recommended { Pill(text: "可先用", color: .gray) }
             }
-            Ring(util: a.util, size: 78)
-            Text(subtitle).font(.system(size: 11)).foregroundColor(a.util == nil || (!a.hasProfile && !a.current) ? .orange : .secondary)
+            Ring(util: a.util ?? a.staleUtil, size: 78)
+                .opacity(a.util == nil && a.staleUtil != nil ? 0.4 : 1)   // 读不到时显示上次的数，变淡
+            VStack(spacing: 3) {
+                Text(subtitle).font(.system(size: 11))
+                    .foregroundColor(a.util == nil || (!a.hasProfile && !a.current) ? .orange : .secondary)
+                if let d = detail {
+                    Text(d.0).font(.system(size: 10)).foregroundColor(d.1).lineLimit(1).minimumScaleFactor(0.8)
+                }
+                if let x = extra { Text(x).font(.system(size: 10)).foregroundColor(.secondary).lineLimit(1) }
+            }
             action
         }
         .padding(12)
@@ -375,8 +454,13 @@ struct AccountCard: View {
 
     @ViewBuilder var action: some View {
         if a.util == nil {
-            Button("重新登录") { openInTerminal("login \(a.name)") }
-                .buttonStyle(.bordered).controlSize(.small)
+            if a.errorKind == "login" {          // 只有登录真失效了才让你去重新登录
+                Button("重新登录") { openInTerminal("login \(a.name)") }
+                    .buttonStyle(.bordered).controlSize(.small)
+            } else {                             // 网络、代理、限流：重新登录解决不了，重试就好
+                Button { m.refresh(network: true) } label: { Label("重试", systemImage: "arrow.clockwise") }
+                    .buttonStyle(.bordered).controlSize(.small).disabled(m.refreshing)
+            }
         } else if a.current {
             Text(m.mode == "idle" ? "用完自动换走" : "正在使用")
                 .font(.system(size: 11)).foregroundColor(.secondary).frame(height: 22)
@@ -388,7 +472,7 @@ struct AccountCard: View {
                 Button("确认切换") { m.requestSwitch(a.name) }.buttonStyle(.borderedProminent).controlSize(.small)
             }
         } else if !a.hasProfile {
-            if recommended {
+            if urgent {
                 Button { openInTerminal("login-desktop \(a.name)") } label: { Label("登录桌面版", systemImage: "person.crop.circle.badge.plus").frame(maxWidth: .infinity) }
                     .buttonStyle(.borderedProminent).controlSize(.small).tint(.orange)
                     .help("在 Claude 桌面版里登录这个号一次，之后就能一键切换")
@@ -398,7 +482,7 @@ struct AccountCard: View {
                     .help("在 Claude 桌面版里登录这个号一次，之后就能一键切换")
             }
         } else if a.hasProfile {
-            if recommended {
+            if urgent {
                 Button { m.requestSwitch(a.name) } label: { Label("切换", systemImage: "arrow.left.arrow.right").frame(maxWidth: .infinity) }
                     .buttonStyle(.borderedProminent).controlSize(.small).tint(.orange)
             } else {
@@ -411,11 +495,16 @@ struct AccountCard: View {
 
 struct Banner: View {
     let icon: String, text: String, color: Color
+    var actionTitle: String? = nil
+    var action: (() -> Void)? = nil
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
             Image(systemName: icon).foregroundColor(color).font(.system(size: 13, weight: .semibold))
             Text(text).font(.system(size: 12)).fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
+            if let t = actionTitle, let act = action {
+                Button(t, action: act).buttonStyle(.bordered).controlSize(.small)
+            }
         }
         .padding(10)
         .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(color.opacity(0.12)))
@@ -462,7 +551,7 @@ struct IconButton: View {
 
 struct MainView: View {
     @ObservedObject var m: Model
-    var modeName: String { ["off": "手动", "notify": "提醒我", "idle": "全自动"][m.mode] ?? "提醒我" }
+    var modeName: String { ["off": "只显示", "notify": "快用完提醒", "idle": "自动换号"][m.mode] ?? "快用完提醒" }
 
     var body: some View {
         VStack(spacing: 14) {
@@ -515,6 +604,10 @@ struct MainView: View {
                    color: .accentColor)
         } else if let t = m.resuming {
             Banner(icon: "play.circle.fill", text: "正在续上被额度打断的任务「\(t.isEmpty ? "会话" : t)」…", color: .accentColor)
+        } else if let since = m.netDownSince {
+            Banner(icon: "wifi.exclamationmark",
+                   text: "代理/网络连不上（\(hhmm(since)) 起），额度是之前读到的。自动计时先暂停，恢复后自动继续。",
+                   color: .orange, actionTitle: "重试", action: { m.refresh(network: true) })
         } else if let w = m.waitUntil {
             Banner(icon: "hourglass",
                    text: "\(m.allText)都用完了。" + (w > 0 ? "\(hhmm(w)) 有号刷新后自动换过去" : "等额度刷新后自动换过去")
@@ -526,10 +619,22 @@ struct MainView: View {
                    color: .orange)
         } else if m.recAction == "need_login" {
             Banner(icon: "person.crop.circle.badge.exclamationmark", text: m.recReason, color: .orange)
-        } else if m.recAction == "switch" {
+        } else if m.recAction == "switch" && m.recUrgent {
             Banner(icon: "lightbulb.fill", text: "建议切到 \(m.display(m.recTarget))：\(m.recReason)", color: .orange)
+        } else if let e = m.etaSoon {
+            Banner(icon: "speedometer",
+                   text: "按现在的速度，\(m.current?.display ?? "当前号")约 \(hhmm(e)) 用完（\(hhmm(m.current?.resetsAt)) 才刷新）。"
+                       + "到时可以换个号，或者先 /compact 一下长对话。", color: .orange)
         } else if m.recAction == "wait" {
             Banner(icon: "hourglass", text: m.recReason, color: .red)
+        } else if m.autoResume && !m.axTrusted {
+            Banner(icon: "hand.raised.fill",
+                   text: "「自动续上」需要「辅助功能」授权（升级后系统会作废旧授权）。没有授权时，被额度打断的任务只能手动续上。",
+                   color: .gray, actionTitle: "去授权",
+                   action: { requestAccessibility(); DispatchQueue.main.asyncAfter(deadline: .now() + 2) { m.axTrusted = AXIsProcessTrusted() } })
+        } else if m.recAction == "switch" {
+            // 「另一个号快到期，可以先用它」：只是提示，不抢眼
+            Banner(icon: "lightbulb", text: "可以先用 \(m.display(m.recTarget))：\(m.recReason)", color: .gray)
         } else if !m.prewarm {
             Banner(icon: "pause.circle", text: "自动提前计时已关闭，\(m.allText)的刷新时间不会自动错开", color: .gray)
         }
@@ -576,6 +681,15 @@ struct MainView: View {
 struct SettingsView: View {
     @ObservedObject var m: Model
     @State private var names: [String: String] = [:]
+    @State private var removing: String? = nil     // 正在确认要移除的号
+    @State private var purge = false               // 移除时是否同时清除本机的登录和备份
+
+    /// removing / purge 只给自检截图用（直接画出「移除确认」打开的样子）
+    init(m: Model, removing: String? = nil, purge: Bool = false) {
+        self.m = m
+        _removing = State(initialValue: removing)
+        _purge = State(initialValue: purge)
+    }
 
     func binding<T>(_ get: @escaping () -> T, _ set: @escaping (T) -> Void) -> Binding<T> { Binding(get: get, set: set) }
 
@@ -596,12 +710,19 @@ struct SettingsView: View {
                 VStack(spacing: 16) {
                     group("切换") {
                         Picker("", selection: binding({ m.mode }, { m.mode = $0; m.set("auto_switch", $0) })) {
-                            Text("手动").tag("off"); Text("提醒我").tag("notify"); Text("全自动").tag("idle")
+                            // 分段控件每段一样宽（按最长那段算），名字太长会把整页撑出面板，所以要短
+                            Text("只显示").tag("off"); Text("快用完提醒").tag("notify"); Text("自动换号").tag("idle")
                         }.pickerStyle(.segmented).labelsHidden().frame(maxWidth: .infinity)
-                        Text(["off": "只显示额度，不打扰你。",
-                              "notify": "该换号时发通知，点通知上的「切换」即可。",
+                        Text(["off": "只显示额度，不发任何通知。",
+                              "notify": "快用完、或按现在的速度会在刷新前用完时提醒你，通知上直接点「切换」。其他时候不打扰。",
                               "idle": "用完才换号，一点不浪费。\(m.allText)都用完时，等先刷新的那个。"][m.mode] ?? "")
                             .font(.system(size: 11)).foregroundColor(.secondary).frame(maxWidth: .infinity, alignment: .leading)
+                            .fixedSize(horizontal: false, vertical: true)
+                        if m.mode == "notify" {
+                            row("提醒我先用快到期的额度", note: "另一个号快刷新、额度还剩很多时，发一条不响铃的提醒。默认只在面板里显示") {
+                                toggle({ m.notifyExpiring }, { m.notifyExpiring = $0; m.set("notify_expiring", $0 ? "on" : "off") })
+                            }
+                        }
                         if m.mode != "idle" {
                             row("用到多少算「快用完」") {
                                 Picker("", selection: binding({ Int(m.threshold) }, { m.threshold = Double($0); m.set("switch_threshold", "\($0)") })) {
@@ -649,12 +770,47 @@ struct SettingsView: View {
                                 Spacer(minLength: 4)
                                 Button { runCduo(["ping", a.name]) { _, _ in m.refresh(network: false) } } label: { Image(systemName: "play.circle") }
                                     .buttonStyle(.borderless).help("让这个号立刻开始计时")
+                                Menu {
+                                    Toggle("参与自动预热", isOn: binding({ a.prewarm }, { v in
+                                        runCduo(["prewarm", a.name, v ? "on" : "off"]) { _, _ in m.refresh(network: false) }
+                                    }))
+                                    Button("重新登录…") { openInTerminal("login \(a.name)") }
+                                    Divider()
+                                    Button(a.current ? "移除…（先切到别的号）" : "移除…") { purge = false; removing = a.name }
+                                        .disabled(a.current)
+                                } label: { Image(systemName: "ellipsis.circle") }
+                                    .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                                    .help("预热、重新登录、移除")
+                            }
+                            if removing == a.name {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Text("移除「\(a.display)」？").font(.system(size: 12, weight: .semibold))
+                                    Toggle(isOn: $purge) {      // 标题用可换行的 Text：AppKit 勾选框的文字默认不换行，会把整页撑宽
+                                        Text("同时清除它在本机的登录和备份（借来的号用完建议勾上）")
+                                            .font(.system(size: 11)).fixedSize(horizontal: false, vertical: true)
+                                    }
+                                    .toggleStyle(.checkbox)
+                                    Text(purge ? "会删除它的命令行登录（含钥匙串）、桌面版登录快照和含它登录的旧备份。"
+                                               : "保留它的登录，以后加回来不用重新授权。")
+                                        .font(.system(size: 11)).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+                                    HStack {
+                                        Spacer()
+                                        Button("取消") { removing = nil }.buttonStyle(.bordered).controlSize(.small)
+                                        Button("移除") {
+                                            runCduo(["remove", a.name] + (purge ? ["--purge"] : [])) { _, _ in
+                                                removing = nil; m.refresh(network: false)
+                                            }
+                                        }.buttonStyle(.borderedProminent).controlSize(.small).tint(.red)
+                                    }
+                                }
+                                .padding(10)
+                                .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.red.opacity(0.08)))
                             }
                         }
                         Button { openInTerminal("setup --add") } label: { Label("添加账号", systemImage: "plus.circle") }
                             .buttonStyle(.borderless).frame(maxWidth: .infinity, alignment: .leading)
                             .help("在「终端」里登录一个新号，加进来一起错峰")
-                        Text("改完名字按回车保存；▶︎ 让这个号立刻开始计时。")
+                        Text("改完名字按回车保存；▶︎ 让这个号立刻开始计时；⋯ 里可以暂停预热、重新登录、移除。")
                             .font(.system(size: 11)).foregroundColor(.secondary).frame(maxWidth: .infinity, alignment: .leading)
                     }
                     group("通用") {
@@ -790,19 +946,40 @@ func statusIcon(_ accts: [Acct]) -> NSImage {
 
 // MARK: - 预览渲染（自检用）
 
+/// 自检：有控件超出面板左右边界就报出来。真实面板里这样的内容会被裁掉，整页往一边歪
+func reportOverflow(_ root: NSView, name: String) {
+    let w = root.bounds.width
+    func walk(_ v: NSView) {
+        for s in v.subviews where !s.isHidden {
+            let r = s.convert(s.bounds, to: root)
+            if r.width > 0 && (r.minX < -0.5 || r.maxX > w + 0.5) {
+                print("LAYOUT OVERFLOW in \(name): \(type(of: s)) x=\(Int(r.minX))…\(Int(r.maxX))，面板宽 \(Int(w))")
+            }
+            walk(s)
+        }
+    }
+    walk(root)
+}
+
 func renderPNG<V: View>(_ view: V, _ path: String, dark: Bool) {
     let ap = NSAppearance(named: dark ? .darkAqua : .aqua)!
-    let host = NSHostingView(rootView: view
+    // 和真实面板一样：NSHostingController 放进固定宽度、真正显示出来的面板（摆在屏幕外，看不见）。
+    // 只用 NSHostingView 量「自然大小」时，分段控件之类的排版和真实面板不一样，内容超宽也看不出来
+    let hc = NSHostingController(rootView: AnyView(view
         .background(dark ? Color(white: 0.16) : Color(white: 0.96))
-        .environment(\.colorScheme, dark ? .dark : .light))
-    host.appearance = ap
-    host.frame = NSRect(origin: .zero, size: host.fittingSize)
-    let win = NSWindow(contentRect: host.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+        .environment(\.colorScheme, dark ? .dark : .light)))
+    let win = NSPanel(contentRect: NSRect(x: -30000, y: -30000, width: panelWidth, height: 600),
+                      styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
     win.appearance = ap
     win.backgroundColor = dark ? NSColor(white: 0.17, alpha: 1) : NSColor(white: 0.95, alpha: 1)
-    win.contentView = host
+    win.contentView = hc.view
+    win.setFrame(NSRect(x: -30000, y: -30000, width: panelWidth, height: max(hc.view.fittingSize.height, 100)), display: false)
+    win.orderFrontRegardless()
+    let host = hc.view
     host.layoutSubtreeIfNeeded()
-    RunLoop.current.run(until: Date().addingTimeInterval(0.4))
+    RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+    defer { win.orderOut(nil) }
+    reportOverflow(host, name: (path as NSString).lastPathComponent)
     guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { return }
     host.cacheDisplay(in: host.bounds, to: rep)
     // cacheDisplay 不画窗口背景，手动铺底色
@@ -966,6 +1143,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         setupNotifications()
         heartbeat()
         model.refresh(network: true)
+        // 刚唤醒时网络和代理要过一会儿才恢复：30 秒后跑一轮（查额度、该预热的预热），别等后台的 5 分钟
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 30) {
+                runCduo(["tick"]) { [weak self] _, _ in self?.model.refresh(network: false) }
+            }
+        }
         timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             guard let self = self else { return }
             self.heartbeat(); self.ticks += 1
@@ -999,9 +1182,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             t = " Cduo"
         } else {
             t = " " + (model.current?.util.map { String(format: "%.0f%%", $0) } ?? "—")
+            if let e = model.etaSoon { t += " · \(hhmm(e))" }     // 预计 1 小时内用完：标题上直接显示时间
         }
         let attr = NSMutableAttributedString(string: t, attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)])
-        if (model.recAction == "switch" || model.recAction == "need_login") && model.switchingTo == nil {
+        if model.actionable && model.switchingTo == nil {     // 只在需要你动手时亮橙点
             attr.append(NSAttributedString(string: " ●", attributes: [.foregroundColor: NSColor.systemOrange, .font: NSFont.systemFont(ofSize: 8)]))
         }
         b.attributedTitle = attr
@@ -1098,7 +1282,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         }
         guard AXIsProcessTrusted() else {
             if !askedAX { askedAX = true; requestAccessibility() }   // 第一次需要时请你授权一次
-            finish("manual", nil); return
+            finish("manual", "Cduo 没有「辅助功能」授权，没法替你发送（升级后系统会作废旧授权）。在 Cduo 面板上点「去授权」就能恢复自动续上。")
+            return
         }
         guard userIdleSeconds() >= 5 else { finish("defer", nil); return }   // 你正在用电脑，晚点再试
         NSWorkspace.shared.open(URL(string: "claude://code/continue?session=\(sid)")!)
@@ -1154,7 +1339,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     }
 
     func post(title: String, body: String, kind: String, target: String?) {
+        let quiet = kind.hasSuffix("_quiet")
         if !notifAuthorized {
+            if quiet { return }      // 系统通知没法做成不打扰的样子：安静的提醒就不发了
             let esc = { (s: String) in s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") }
             let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
             p.arguments = ["-e", "display notification \"\(esc(body))\" with title \"\(esc(title))\""]
@@ -1162,13 +1349,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         }
         let c = UNMutableNotificationContent()
         c.title = title; c.body = body
-        if kind == "suggest", let t = target { c.categoryIdentifier = "SUGGEST"; c.userInfo = ["target": t] }
+        if kind.hasPrefix("suggest"), let t = target { c.categoryIdentifier = "SUGGEST"; c.userInfo = ["target": t] }
+        if quiet { c.interruptionLevel = .passive }   // 不响铃、不弹横幅，只进通知中心
         UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil))
     }
 
     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
                                 withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
-        completionHandler([.banner, .list])
+        // 安静的提醒只进通知中心，不弹横幅
+        completionHandler(notification.request.content.interruptionLevel == .passive ? [.list] : [.banner, .list])
     }
 
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
@@ -1199,6 +1388,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
                 let s = dark ? "dark" : "light"
                 renderPNG(MainView(m: model), "\(dir)/main-\(s).png", dark: dark)
                 renderPNG(SettingsView(m: model), "\(dir)/settings-\(s).png", dark: dark)
+                if let r = model.accts.first(where: { !$0.current }) {      // 「移除」确认打开的样子
+                    renderPNG(SettingsView(m: model, removing: r.name, purge: true), "\(dir)/settings-remove-\(s).png", dark: dark)
+                }
                 let sw = Model(); sw.apply(runCduoSync(["status", "--json", "--cached"]).0)
                 sw.recAction = "switch"; sw.recTarget = sw.accts.first(where: { !$0.current })?.name; sw.recReason = "当前号已用 96%"
                 if let i = sw.accts.firstIndex(where: { $0.current }) { sw.accts[i].util = 96; sw.accts[i].running = true }

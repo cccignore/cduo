@@ -15,5 +15,6 @@ jobs:
           /usr/bin/python3 tests/test_resume.py
           /usr/bin/python3 tests/test_core.py
           /usr/bin/python3 tests/test_multi.py
+          /usr/bin/python3 tests/test_ux.py
       - name: Build the menu bar app
         run: bash build_app.sh "$RUNNER_TEMP/build"
