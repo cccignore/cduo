@@ -23,9 +23,11 @@ import plistlib
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
+import http.client
 import urllib.error
 import urllib.request
 
@@ -60,13 +62,19 @@ FAKE_DESKTOP = os.environ.get("CDUO_FAKE_DESKTOP") == "1"   # 测试用：不真
 DRY_PING = os.environ.get("CDUO_DRY_PING") == "1"           # 测试用：不真的发预热
 PING_SETTLE = 10 * 60   # 预热成功后这么久内，额度接口还没显示新窗口，就按预热时间估算
 PING_POLL = (5, 5, 10, 10)   # 预热成功后再查几次额度（秒）：接口要过十几秒才显示新窗口
+NETWORK_RETRY = 10 * 60      # 预热因为网络/代理失败时，这么久后就再试（不按 60 分钟退避）
+WEEKLY_TIGHT = 80            # 周额度用到这个百分比：不再预热、不再建议「先用快到期的」
+ETA_SOON = 60 * 60           # 预计这么久之内用完，才在菜单栏标题上显示时间、发提醒
+SOFT_KINDS = ("network", "server", "denied", "ratelimit")   # 这几类读不到额度的错误常常是偶发的
+SOFT_STALE = 15 * 60         # 只失败了一次、上次读到的数又不超过这么久：照常显示，不报错
 
 DEFAULT_CONFIG = {
     "claude_bin": None,
     "proxy": "auto",                 # auto=跟随系统代理；""=不用；或 http://127.0.0.1:端口
     "active_hours": {"start": "06:00", "end": "02:00"},  # 只在这段时间内自动预热
     "switch_threshold": 95,          # 当前号用到这个百分比就建议/自动切换
-    "auto_switch": "notify",         # off=手动 | notify=提醒我 | idle=用满且空闲时自动切
+    "auto_switch": "notify",         # off=只显示 | notify=快用完提醒 | idle=自动换号
+    "notify_expiring": False,        # 另一个号快到期时，也提醒「先用它」（默认只在面板里显示）
     "prewarm_enabled": True,         # 是否自动"提前开始计时"
     "confirm_switch": True,          # 菜单栏切换前是否弹确认
     "work_hours": None,              # {"start":"10:00","end":"01:00"}，只用于显示；active_hours 由它推出
@@ -76,7 +84,8 @@ DEFAULT_CONFIG = {
     "accounts": [],
 }
 
-MODE_TEXT = {"off": "手动", "notify": "提醒我", "idle": "全自动（用完自动换号，被打断的任务自动续上）"}
+MODE_TEXT = {"off": "只显示", "notify": "快用完提醒",
+             "idle": "自动换号（用完自动换号，被打断的任务自动续上）"}
 
 TTY = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
 C = {k: (v if TTY else "") for k, v in {
@@ -206,6 +215,8 @@ def notify(msg: str, title: str = "Cduo", kind: str = "info", target: str | None
         tmp.write_text(json.dumps({"t": now(), "title": title, "msg": msg, "kind": kind, "target": target},
                                   ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, NOTIFY_DIR / name)
+        return
+    if kind.endswith("_quiet"):   # 安静的提醒交给菜单栏发成「不打扰」级别；没有菜单栏就不发，别弹横幅
         return
     esc = lambda s: s.replace("\\", "\\\\").replace('"', '\\"')
     subprocess.run(["osascript", "-e",
@@ -443,7 +454,17 @@ def claude_version(cfg: dict) -> str:
     return v or UA_FALLBACK_VERSION
 
 
+HTTP_RETRY_WAIT = (0.6, 1.5)   # 只读请求碰到一次性的网络错误时，等这么久再试（最多再试两次）
+
+
 def http_json(cfg: dict, url: str, data: dict | None = None, headers: dict | None = None, timeout=20):
+    """发请求、读 JSON。
+
+    代理偶尔会把 TLS 连接直接掐断（「EOF occurred in violation of protocol」）或者重置连接，
+    随机落在某一次请求上。只读的 GET 请求遇到这类网络错误时，稍等再试，最多再试两次。
+    超时不重试：已经等了 timeout 秒，多半是真的断网了，再试只会让这一轮卡得更久。
+    POST（刷新凭据）不重试：服务器可能已经收到并换发了新凭据，再拿旧凭据重试反而会被当成登录失效。
+    """
     px = proxy_url(cfg)
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": px, "https": px} if px else {}))
     h = {"User-Agent": f"claude-cli/{claude_version(cfg)} (external, cli)"}
@@ -452,9 +473,18 @@ def http_json(cfg: dict, url: str, data: dict | None = None, headers: dict | Non
     if data is not None:
         body = json.dumps(data).encode()
         h["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=body, headers=h)
-    with opener.open(req, timeout=timeout) as r:
-        return json.loads(r.read())
+    waits = HTTP_RETRY_WAIT if body is None else ()
+    for i in range(len(waits) + 1):
+        req = urllib.request.Request(url, data=body, headers=h)
+        try:
+            with opener.open(req, timeout=timeout) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError:
+            raise                                     # 服务器正经回了错误码：重试没用
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
+            if i == len(waits) or isinstance(getattr(e, "reason", e), (socket.timeout, TimeoutError)):
+                raise
+            time.sleep(waits[i])
 
 
 # ───────────────────────── CLI 凭据（钥匙串） ─────────────────────────
@@ -509,7 +539,37 @@ def cli_identity(cli_dir: str) -> dict:
             "email": a.get("emailAddress"), "org_name": a.get("organizationName")}
 
 
-_TOKEN_ERR: dict = {}   # 账号名 -> 最近一次拿不到 token 的原因（显示在额度那一栏）
+_TOKEN_ERR: dict = {}   # 账号名 -> (最近一次拿不到 token 的原因, 类型)，显示在额度那一栏
+
+# 出错的类型决定菜单栏给什么按钮：只有 login 才让人去「重新登录」，其余给「重试」
+#   login 登录失效 · network 网络/代理不通 · denied 请求被拒（403）· ratelimit 限流（429）· server 服务端出错 · other
+
+
+def classify_error(e) -> tuple:
+    """把请求出的错归类，返回 (给人看的原因, 类型)。"""
+    if isinstance(e, urllib.error.HTTPError):
+        c = e.code
+        if c in (400, 401):
+            return f"登录已失效（HTTP {c}）", "login"
+        if c == 403:
+            return "请求被拒（HTTP 403，多半是代理的问题）", "denied"
+        if c == 429:
+            return "额度接口限流（HTTP 429），稍后自动再查", "ratelimit"
+        if c >= 500:
+            return f"Anthropic 服务端出错（HTTP {c}）", "server"
+        return f"HTTP {c}", "other"
+    if isinstance(e, (KeyError, TypeError)):
+        return "返回的数据不对", "other"
+    return f"网络/代理连不上（{type(e).__name__}）", "network"
+
+
+def _retry_after(e) -> float:
+    """429 时服务器要求等多久（秒）；没给就等 5 分钟，最长 1 小时。"""
+    try:
+        s = float((e.headers or {}).get("Retry-After") or 300)
+    except (TypeError, ValueError):
+        s = 300
+    return min(max(s, 60), 3600)
 
 
 def _take_refresh_lock(lock: pathlib.Path) -> bool:
@@ -541,7 +601,7 @@ def ensure_fresh_token(cfg: dict, acct: dict, force: bool = False) -> str | None
     name, cli_dir = acct["name"], acct["cli_dir"]
     full, where = read_creds(cli_dir)
     if not full or "claudeAiOauth" not in full:
-        _TOKEN_ERR[name] = "未登录"
+        _TOKEN_ERR[name] = ("未登录", "login")
         return None
     c = full["claudeAiOauth"]
     left = c.get("expiresAt", 0) / 1000 - now()
@@ -551,7 +611,7 @@ def ensure_fresh_token(cfg: dict, acct: dict, force: bool = False) -> str | None
         return c.get("accessToken")
     if not acct.get("owned") or not c.get("refreshToken"):
         if not usable:
-            _TOKEN_ERR[name] = "凭据过期" + ("" if acct.get("owned") else "（共用目录要由 claude 自己续期）")
+            _TOKEN_ERR[name] = ("凭据过期" + ("" if acct.get("owned") else "（共用目录要由 claude 自己续期）"), "login")
         return usable
     lock = pathlib.Path(cli_dir) / ".oauth_refresh.lock"
     if not _take_refresh_lock(lock):
@@ -565,7 +625,7 @@ def ensure_fresh_token(cfg: dict, acct: dict, force: bool = False) -> str | None
         c2 = (read_creds(cli_dir)[0] or {}).get("claudeAiOauth") or {}
         if c2.get("expiresAt", 0) / 1000 - now() > 60:
             return c2.get("accessToken")
-        _TOKEN_ERR[name] = "凭据正在刷新，稍后再试"
+        _TOKEN_ERR[name] = ("凭据正在刷新，稍后再试", "other")
         return None
     try:
         try:
@@ -577,8 +637,8 @@ def ensure_fresh_token(cfg: dict, acct: dict, force: bool = False) -> str | None
             log(f"token refresh failed for {name}: {e}")
             if usable:            # 刷新失败但旧 token 还没过期：先用着，下一轮再刷
                 return usable
-            code = f"HTTP {e.code}" if isinstance(e, urllib.error.HTTPError) else type(e).__name__
-            _TOKEN_ERR[name] = f"凭据过期，刷新失败（{code}）"
+            why, kind = classify_error(e)
+            _TOKEN_ERR[name] = (f"凭据刷新失败：{why}", kind)
             return None
         t = int(now() * 1000)
         c["accessToken"] = access
@@ -603,15 +663,14 @@ def fetch_account_usage(cfg: dict, acct: dict) -> dict:
     res = {"fetched": now(), "util": None, "resets_at": None, "ok": False, "error": None, "no5h": False}
     tok = ensure_fresh_token(cfg, acct)
     if not tok:
-        res["error"] = _TOKEN_ERR.get(acct["name"]) or "凭据过期/未登录"
+        res["error"], res["error_kind"] = _TOKEN_ERR.get(acct["name"]) or ("凭据过期/未登录", "login")
         return res
     try:
         u = http_json(cfg, USAGE_URL, headers={"Authorization": f"Bearer {tok}", "anthropic-beta": "oauth-2025-04-20"})
-    except urllib.error.HTTPError as e:
-        res["error"] = f"HTTP {e.code}"
-        return res
     except Exception as e:
-        res["error"] = str(e)[:80]
+        res["error"], res["error_kind"] = classify_error(e)
+        if isinstance(e, urllib.error.HTTPError) and e.code == 429:
+            res["retry_at"] = now() + _retry_after(e)     # 被限流：按服务器说的时间再查
         return res
     fh = u.get("five_hour")
     res["ok"] = True
@@ -642,6 +701,9 @@ def est_resets(u: dict):
         if window_running(u):
             return u["resets_at"]
         return lp + WINDOW if lp and now() - lp < PING_SETTLE else None
+    sr = (u or {}).get("stale_resets_at")
+    if sr and sr > now():          # 网络断了：用上次读到的刷新时间，别把正在计时的号当成空闲去预热
+        return sr
     if lp and lp + WINDOW > now():
         return lp + WINDOW
     return None
@@ -665,6 +727,143 @@ def effective_util(u: dict):
     return u["util"] if window_running(u) else 0.0
 
 
+def decision_util(u: dict):
+    """做决定时用的已用百分比：接口读不到时，用上次读到的（只要那个窗口还没刷新）。"""
+    eu = effective_util(u)
+    if eu is not None:
+        return eu
+    if ((u or {}).get("stale_resets_at") or 0) > now():
+        return u.get("stale_util")
+    return None
+
+
+def decision_resets(u: dict):
+    """做决定时用的刷新时间，和 decision_util 配套：接口读不到时，用上次读到的（只要还没到）。
+    免得偶尔一次读不到，这个号就被当成「没在计时」，推荐顺序跟着乱跳。"""
+    if window_running(u):
+        return u["resets_at"]
+    sr = (u or {}).get("stale_resets_at")
+    if not (u or {}).get("ok") and sr and sr > now():
+        return sr
+    return None
+
+
+def weekly_tight(u: dict) -> bool:
+    w = (u or {}).get("weekly_util")
+    return w is not None and w >= WEEKLY_TIGHT
+
+
+def weekly_out(u: dict) -> bool:
+    w = (u or {}).get("weekly_util")
+    return w is not None and w >= 99.5
+
+
+def with_history(prev: dict, u: dict) -> dict:
+    """记下这个窗口里每次读到的已用百分比（最多 24 个点），用来算消耗速度。换了窗口就重新记。"""
+    if not u.get("ok") or u.get("no5h") or not window_running(u):
+        return u
+    prev = prev or {}
+    old = prev.get("hist") or []
+    same = abs((prev.get("resets_at") or prev.get("stale_resets_at") or 0) - u["resets_at"]) < 120
+    u["hist"] = ((old if same else []) + [[u.get("fetched") or now(), u["util"]]])[-24:]
+    return u
+
+
+def carry_stale(prev: dict, u: dict) -> dict:
+    """这次没读到额度时，带上上次读到的数（和它的时间），菜单栏显示「X 分钟前的数据」，不显示成空白。"""
+    if u.get("ok"):
+        u["ok_at"] = u.get("fetched") or now()
+        u["fails"] = 0
+        return u
+    prev = prev or {}
+    u["fails"] = (prev.get("fails") or 0) + 1      # 连续读不到几次了：偶尔一次不算，连续两次才报出来
+    u["ok_at"] = prev.get("ok_at")                 # 上次读成功是什么时候（空闲的号也记，用来判断是不是偶发）
+    if prev.get("ok") and not prev.get("no5h") and window_running(prev):
+        u["stale_util"], u["stale_resets_at"] = prev.get("util"), prev["resets_at"]
+    elif (prev.get("stale_resets_at") or 0) > now():
+        u["stale_util"], u["stale_resets_at"] = prev.get("stale_util"), prev["stale_resets_at"]
+    for k in ("weekly_util", "weekly_resets_at", "hist"):
+        if k in prev and k not in u:
+            u[k] = prev[k]
+    return u
+
+
+def soft_fail(u: dict) -> bool:
+    """这次没读到，但只是偶尔一次：连续失败不到两次、错误是网络/服务器这类常见的偶发问题，
+    上次读到的数也是最近（15 分钟内）的。这种情况照常显示上次的数，不报错，下一轮多半就好了。
+    登录失效这类要人处理的错误，第一次就报。"""
+    u = u or {}
+    return (not u.get("ok") and (u.get("fails") or 0) < 2 and u.get("error_kind") in SOFT_KINDS
+            and now() - (u.get("ok_at") or 0) < SOFT_STALE)
+
+
+def as_shown(u: dict) -> dict:
+    """显示给人看的额度：偶发的一次失败，按上次读到的数显示成正常状态（只用于显示，不改存下来的状态）。"""
+    if not soft_fail(u):
+        return u or {}
+    v = dict(u, ok=True, error=None, error_kind=None)
+    if (u.get("stale_resets_at") or 0) > now():
+        v["util"], v["resets_at"] = u.get("stale_util"), u["stale_resets_at"]
+    else:                                  # 上次读到时没在计时：还是满额
+        v["util"], v["resets_at"] = 0.0, None
+    return v
+
+
+def eta_of(u: dict):
+    """按最近一小时的消耗速度，预计几点用完。不会在刷新前用完、或者数据不够时返回 None。"""
+    if not u or not u.get("ok") or not window_running(u):
+        return None
+    h = [x for x in (u.get("hist") or []) if x[0] >= now() - 3600]
+    if len(h) < 2:
+        return None
+    (t0, u0), (t1, u1) = h[0], h[-1]
+    if t1 - t0 < 10 * 60 or u1 - u0 < 2 or u1 >= 100:
+        return None
+    eta = t1 + (100 - u1) * (t1 - t0) / (u1 - u0)
+    return eta if eta < u["resets_at"] else None
+
+
+def can_ping(u: dict) -> bool:
+    """这个号这一轮能不能发预热。
+
+    要这一轮额度刚读成功（说明网络、代理、登录此刻都正常，合盖时代理不通就不白发），
+    不在失败后的等待期（网络类失败 10 分钟后就重试，其他失败等 1 小时），周额度也不紧张。
+    """
+    if not (u or {}).get("ok") or weekly_tight(u):
+        return False
+    return now() > ping_retry_at(u)
+
+
+def ping_retry_at(u: dict) -> float:
+    """上次预热之后，最早什么时候可以再发：成功后 15 分钟（接口显示新窗口有延迟），
+    网络类失败 10 分钟，其他失败 1 小时。"""
+    u = u or {}
+    if u.get("last_ping_ok", True):
+        wait = 15 * 60
+    elif u.get("last_ping_kind") in ("network", "denied", "ratelimit"):
+        wait = NETWORK_RETRY
+    else:
+        wait = 60 * 60
+    return (u.get("last_ping") or 0) + wait
+
+
+_PING_ERR: dict = {}   # 账号名 -> 最近一次预热失败的类型（login / network / denied / ratelimit / other）
+
+
+def _ping_error_kind(text: str) -> str:
+    t = (text or "").lower().replace(" ", "")
+    if "notloggedin" in t or "/login" in t or '"api_error_status":401' in t:
+        return "login"
+    if '"api_error_status":403' in t or "requestnotallowed" in t:
+        return "denied"
+    if '"api_error_status":429' in t or "ratelimit" in t:
+        return "ratelimit"
+    if any(k in t for k in ("timedout", "timeout", "econn", "enotfound", "eai_again", "network", "socket",
+                            "fetchfailed", "certificate", "ssl")):
+        return "network"
+    return "other"
+
+
 def do_ping(cfg: dict, acct: dict, reason: str) -> bool:
     claude = cfg.get("claude_bin")
     if not claude:
@@ -685,9 +884,14 @@ def do_ping(cfg: dict, acct: dict, reason: str) -> bool:
             ok = p.returncode == 0 and json.loads(p.stdout).get("is_error") is False
         except Exception:
             ok = False
+        if ok:
+            _PING_ERR.pop(acct["name"], None)
+        else:
+            _PING_ERR[acct["name"]] = _ping_error_kind(p.stdout + p.stderr)
         log(f"ping {acct['name']} ({reason}) -> {'ok' if ok else 'FAIL'} {'' if ok else (p.stdout + p.stderr)[-300:]}")
         return ok
     except Exception as e:
+        _PING_ERR[acct["name"]] = "network" if isinstance(e, subprocess.TimeoutExpired) else "other"
         log(f"ping {acct['name']} error: {e}")
         return False
 
@@ -1314,33 +1518,40 @@ def lbl(cfg: dict, name) -> str:
     return (a.get("label") or name) if a else name
 
 
-def plan_pings(cfg: dict, st: dict):
-    """返回 (要立刻预热的账号, 说明, 下一次预计预热时间)。
+def ping_candidates(cfg: dict, st: dict):
+    """返回 (现在就该开始计时的号，按优先级排好；说明；下一次预计预热时间)。还没到点时列表是空的。
 
     规则：n 个账号的重置时刻在 5h 内均匀错开（2 个号=相隔 2.5h，3 个号=相隔 1h40m，以此类推）。
     - 都没在计时：先启动桌面版当前在用的那个；
     - 有在计时的：当最近启动的那个窗口已经跑了 5h/n，就启动下一个空闲账号。
+    排在前面的号这一轮发不了（网络不通、在失败后的等待期……）时，tick 会接着试后面的，不会卡住。
     """
     accts = prewarm_accounts(cfg)
     if not accts:
-        return None, "没有参与预热的账号", None
+        return [], "没有参与预热的账号", None
     n = len(accts)
     gap = WINDOW / n
     rs = {a["name"]: est_resets(st["accounts"].get(a["name"], {})) for a in accts}
     running = [a for a in accts if rs[a["name"]]]
     idle = [a for a in accts if not rs[a["name"]]]
     if not idle:
-        return None, f"{accounts_text(n)}都在计时，刷新时间已错开", None
+        return [], f"{accounts_text(n)}都在计时，刷新时间已错开", None
     cur = st.get("desktop_current")
     idle.sort(key=lambda a: (0 if a["name"] == cur else 1, accts.index(a)))
     first = lbl(cfg, idle[0]["name"])
     if not running:
-        return idle[0], f"现在让 {first} 开始计时", now()
+        return idle, f"现在让 {first} 开始计时", now()
     latest = max(rs[a["name"]] for a in running)
     due = latest - (WINDOW - gap)
     if now() >= due:
-        return idle[0], f"现在让 {first} 开始计时（与上一个号错开 {dur(gap)}）", due
-    return None, f"{first} 将在 {hhmm(due)} 自动开始计时（错开 {dur(gap)}）", due
+        return idle, f"现在让 {first} 开始计时（与上一个号错开 {dur(gap)}）", due
+    return [], f"{first} 将在 {hhmm(due)} 自动开始计时（错开 {dur(gap)}）", due
+
+
+def plan_pings(cfg: dict, st: dict):
+    """返回 (排在最前、要立刻预热的账号, 说明, 下一次预计预热时间)。"""
+    cands, why, due = ping_candidates(cfg, st)
+    return (cands[0] if cands else None), why, due
 
 
 def recommend(cfg: dict, st: dict) -> dict:
@@ -1353,39 +1564,47 @@ def recommend(cfg: dict, st: dict) -> dict:
     info = {}
     for a in cands:
         u = st["accounts"].get(a["name"], {})
-        eu = effective_util(u)
-        info[a["name"]] = {"util": eu, "running": window_running(u), "resets": u.get("resets_at") if window_running(u) else None}
-    usable = [n for n, i in info.items() if i["util"] is None or i["util"] < thr]
+        eu, dr = decision_util(u), decision_resets(u)   # 接口暂时读不到时，用上次读到的数
+        info[a["name"]] = {"util": eu, "running": bool(dr), "resets": dr,
+                           "weekly_out": weekly_out(u), "weekly_tight": weekly_tight(u)}
+    usable = [n for n, i in info.items() if (i["util"] is None or i["util"] < thr) and not i["weekly_out"]]
     if not usable:
         for a in cfg["accounts"]:          # 还有额度、只是没在桌面版登录过的号
             if has_profile(a["name"]):
                 continue
             eu = effective_util(st["accounts"].get(a["name"], {}))
             if eu is not None and eu < thr:
-                return {"action": "need_login", "target": a["name"], "urgent": True,
+                return {"action": "need_login", "kind": "need_login", "target": a["name"], "urgent": True,
                         "reason": f"{lbl(cfg, a['name'])} 还有额度，但还没在桌面版登录过。"
                                   f"点它卡片上的「登录桌面版」，登录一次以后就能一键切换"}
         soon = min((i["resets"] for i in info.values() if i["resets"]), default=None)
-        return {"action": "wait", "target": None,
+        return {"action": "wait", "kind": "wait", "target": None,
                 "reason": f"{accounts_text(len(cfg['accounts']))}都快用完了，{hhmm(soon)} 恢复"}
-    rank = sorted(usable, key=lambda n: (0 if info[n]["running"] else 1, info[n]["resets"] or 9e12,
-                                         0 if n == cur else 1))
+    # 周额度紧张的号排后面；同样情况下先用快刷新的（没用完的 5 小时额度到点就作废）
+    rank = sorted(usable, key=lambda n: (1 if info[n]["weekly_tight"] else 0, 0 if info[n]["running"] else 1,
+                                         info[n]["resets"] or 9e12, 0 if n == cur else 1))
     best = rank[0]
     if cur not in usable:
-        why = (f"{lbl(cfg, cur)} 已用 {info[cur]['util']:.0f}%" if cur in info and info[cur]["util"] is not None
-               else "当前号不可用")
-        return {"action": "switch", "target": best, "urgent": True, "reason": why}
-    if best != cur and info[best]["running"] and info[best]["util"] is not None:
+        if cur in info and info[cur]["weekly_out"]:
+            why = f"{lbl(cfg, cur)} 本周额度用完了"
+        elif cur in info and info[cur]["util"] is not None:
+            why = f"{lbl(cfg, cur)} 已用 {info[cur]['util']:.0f}%"
+        else:
+            why = "当前号不可用"
+        return {"action": "switch", "kind": "limit", "target": best, "urgent": True, "reason": why}
+    # 「先用快到期的」只在那个号周额度不紧张时才划算：否则是在花周额度
+    if best != cur and info[best]["running"] and info[best]["util"] is not None and not info[best]["weekly_tight"]:
         left = 100 - info[best]["util"]
         soon = info[best]["resets"] - now() <= 90 * 60
         cur_later = (not info[cur]["running"]) or (info[cur]["resets"] or 0) - info[best]["resets"] >= 30 * 60
         if soon and left >= 25 and cur_later:
-            return {"action": "switch", "target": best, "urgent": False,
+            return {"action": "switch", "kind": "expiring", "target": best, "urgent": False,
                     "reason": f"{lbl(cfg, best)} 还剩 {left:.0f}%，{hhmm(info[best]['resets'])} 刷新后就作废，先用它"}
-    return {"action": "stay", "target": cur, "reason": "当前用的就是最合适的号"}
+    return {"action": "stay", "kind": "stay", "target": cur, "reason": "当前用的就是最合适的号"}
 
 
-TICK_OWNED = ("desktop_org", "next_ping", "recommend", "interrupted", "resume_wait", "post_switch_warned")
+TICK_OWNED = ("desktop_org", "next_ping", "recommend", "interrupted", "resume_wait", "post_switch_warned",
+              "notified", "net_down_since")
 
 
 def _save_tick_state(cfg: dict, st: dict, notified0) -> None:
@@ -1438,6 +1657,49 @@ def check_after_switch(st: dict, app_up: bool) -> None:
         st["post_switch_warned"] = at
 
 
+def _notify_once(st: dict, key: str, msg: str, title: str, kind: str = "info", target=None) -> None:
+    seen = st.setdefault("notified", {})
+    if key in seen:
+        return
+    notify(msg, title, kind=kind, target=target)
+    seen[key] = now()
+
+
+def notify_policy(cfg: dict, st: dict, rec: dict, inter: list) -> None:
+    """「快用完提醒」模式下发哪些通知：只在需要你动手时打扰你，同一件事每个窗口只提醒一次。
+
+    - 任务被额度打断、当前号快用完、按现在的速度会在刷新前用完：发，带「切换」按钮；
+    - 另一个号快到期「先用它」：默认只在面板里显示；当前号已经用得多（≥60%）或预计会用完，
+      或者打开了 notify_expiring，才发，而且是不打扰的「被动」通知。
+    """
+    cur = st.get("desktop_current")
+    cu = st["accounts"].get(cur, {}) if cur else {}
+    win = int(cu.get("resets_at") or 0)
+    tgt = rec.get("target") if rec.get("action") == "switch" else None
+    if inter and tgt:
+        first = inter[0]
+        _notify_once(st, f"inter:{first.get('error_uuid') or first.get('session')}",
+                     f"点「切换」换到 {lbl(cfg, tgt)}，并自动续上被打断的任务", "任务被额度打断了", "suggest", tgt)
+    elif rec.get("action") == "switch" and rec.get("urgent"):
+        _notify_once(st, f"limit:{cur}:{win}", rec["reason"],
+                     (f"{lbl(cfg, cur)} 快用完了" if cur else "该换号了") + f"，可以换到 {lbl(cfg, tgt)}", "suggest", tgt)
+    else:
+        eta = eta_of(cu) if cur else None
+        if eta and eta - now() <= ETA_SOON:
+            nxt = pick_target(cfg, st, exclude=cur)
+            _notify_once(st, f"eta:{cur}:{win}",
+                         f"按现在的速度，约 {hhmm(eta)} 用完（{hhmm(cu.get('resets_at'))} 才刷新）"
+                         + (f"，到时可以换到 {lbl(cfg, nxt)}" if nxt else ""),
+                         f"{lbl(cfg, cur)} 快用完了", "suggest" if nxt else "info", nxt)
+        if rec.get("action") == "switch" and rec.get("kind") == "expiring":
+            hot = (decision_util(cu) or 0) >= 60 or bool(eta)
+            if hot or cfg.get("notify_expiring"):
+                bu = st["accounts"].get(tgt, {})
+                _notify_once(st, f"expiring:{tgt}:{int(bu.get('resets_at') or 0)}", rec["reason"],
+                             f"可以先用 {lbl(cfg, tgt)} 的额度", "suggest_quiet", tgt)
+    st["notified"] = {k: v for k, v in (st.get("notified") or {}).items() if now() - v < 86400}
+
+
 def tick(cfg: dict, verbose: bool = False, allow_ping: bool = True) -> dict:
     with file_lock("tick", blocking=False) as got:
         if not got:
@@ -1447,10 +1709,22 @@ def tick(cfg: dict, verbose: bool = False, allow_ping: bool = True) -> dict:
         notified0 = st.get("last_notified")
         for a in cfg["accounts"]:
             prev = st["accounts"].get(a["name"], {})
-            u = fetch_account_usage(cfg, a)
+            if (prev.get("retry_at") or 0) > now():      # 被限流：按服务器要求的时间再查，先沿用上次的
+                u = dict(prev)
+            else:
+                u = carry_stale(prev, with_history(prev, fetch_account_usage(cfg, a)))
             u["last_ping"] = prev.get("last_ping")
             u["last_ping_ok"] = prev.get("last_ping_ok", True)
+            u["last_ping_kind"] = prev.get("last_ping_kind")
             st["accounts"][a["name"]] = u
+        # 所有号都因为网络/代理读不到、而且连续两轮都这样：记下从什么时候开始，预热先暂停（发了也是白发）
+        # 只失败一轮不算：代理偶尔掐断一次连接很常见，不值得弹「网络连不上」
+        errs = [st["accounts"][a["name"]] for a in cfg["accounts"]]
+        if errs and all(not x.get("ok") and x.get("error_kind") == "network" and (x.get("fails") or 0) >= 2
+                        for x in errs):
+            st["net_down_since"] = st.get("net_down_since") or now()
+        else:
+            st.pop("net_down_since", None)
         cur = current_desktop_profile(cfg, st)
         if cur:
             st["desktop_current"] = cur
@@ -1468,13 +1742,17 @@ def tick(cfg: dict, verbose: bool = False, allow_ping: bool = True) -> dict:
         except Exception as e:
             log(f"background sync failed: {e}")
         pinged = None
-        acct, why, due = plan_pings(cfg, st)
+        cands, why, due = ping_candidates(cfg, st)
+        acct = cands[0] if cands else None
         active = in_active_hours(cfg)
         enabled = cfg.get("prewarm_enabled", True)
-        if allow_ping and active and acct and enabled:
-            u0 = st["accounts"][acct["name"]]
-            backoff = 15 * 60 if u0.get("last_ping_ok", True) else 60 * 60
-            if now() - (u0.get("last_ping") or 0) > backoff:
+        net_down = bool(st.get("net_down_since"))
+        if allow_ping and active and enabled and cands and not net_down:
+            # 排在前面的号这一轮发不了，就试下一个，别让一个号卡住所有号
+            pick = next((x for x in cands if can_ping(st["accounts"].get(x["name"], {}))), None)
+            if pick:
+                acct = pick
+                prev = st["accounts"][acct["name"]]
                 okp = do_ping(cfg, acct, why)
                 if okp:
                     pinged = acct["name"]
@@ -1484,11 +1762,31 @@ def tick(cfg: dict, verbose: bool = False, allow_ping: bool = True) -> dict:
                         break
                     time.sleep(wait)        # 接口要过十几秒才显示新窗口，再查一次
                     nu = fetch_account_usage(cfg, acct)
+                nu = carry_stale(prev, with_history(prev, nu))
                 nu["last_ping"], nu["last_ping_ok"] = now(), okp
+                nu["last_ping_kind"] = None if okp else _PING_ERR.get(acct["name"], "other")
                 st["accounts"][acct["name"]] = nu
-                acct, why, due = plan_pings(cfg, st)
+                cands, why, due = ping_candidates(cfg, st)
+                acct = cands[0] if cands else None
+        if cands and due is not None:
+            # 到点了：「接下来」显示第一个现在就能发的号；都还在失败后的等待期时，显示最早能再试的那个
+            ready = [x for x in cands if can_ping(st["accounts"].get(x["name"], {}))]
+            if ready:
+                if ready[0] is not cands[0]:
+                    why = f"现在让 {lbl(cfg, ready[0]['name'])} 开始计时（{lbl(cfg, cands[0]['name'])} 这次没能预热，先轮到它）"
+                acct = ready[0]
+            else:
+                waits = [(ping_retry_at(st["accounts"].get(x["name"], {})), i, x) for i, x in enumerate(cands)
+                         if st["accounts"].get(x["name"], {}).get("last_ping_ok") is False]
+                if waits:
+                    t, _, x = min(waits)
+                    if t > due:
+                        due, acct = t, x
+                        why = f"{lbl(cfg, x['name'])} 预热失败，{hhmm(t)} 再试"
         if not enabled:
             why = "自动提前计时已关闭"
+        elif net_down:
+            why = "网络/代理连不上，恢复后继续自动计时"
         elif not active:
             why = f"现在不在自动计时时段（{cfg['active_hours']['start']}–{cfg['active_hours']['end']}）"
         idle_next = [x["name"] for x in prewarm_accounts(cfg) if not est_resets(st["accounts"].get(x["name"], {}))]
@@ -1513,7 +1811,7 @@ def tick(cfg: dict, verbose: bool = False, allow_ping: bool = True) -> dict:
                 tgt = pick_target(cfg, st, exclude=cur)
                 if tgt:
                     plan = ("switch", tgt, inter)
-                    rec = {"action": "switch", "target": tgt, "urgent": True,
+                    rec = {"action": "switch", "kind": "limit", "target": tgt, "urgent": True,
                            "reason": f"{lbl(cfg, cur)} 额度用完了" + ("，换号后自动续上被打断的任务" if inter else "")}
                     st["recommend"] = rec
                 else:
@@ -1530,15 +1828,9 @@ def tick(cfg: dict, verbose: bool = False, allow_ping: bool = True) -> dict:
             # 桌面版的 Claude Code 会话 1 小时没动静（缓存反正过期了，换号不多花），而且你 10 分钟没碰电脑。
             # 普通聊天的回复不写会话记录，所以要靠"你离开了"来保证不会在你聊天、打字时把 App 重启掉
             plan = ("switch", rec["target"], [])
-        key = f"{rec.get('action')}:{rec.get('target')}"
-        if mode != "idle" and rec.get("action") == "switch" and st.get("last_notified") != key and mode != "off":
-            title = f"建议切换到 {lbl(cfg, rec['target'])}"
-            msg = rec["reason"]
-            if inter:
-                title, msg = "任务被额度打断了", f"点「切换」换到 {lbl(cfg, rec['target'])}，并自动续上被打断的任务"
-            notify(msg, title, kind="suggest", target=rec["target"])
-            st["last_notified"] = key
-        elif rec.get("action") != "switch" and not str(st.get("last_notified") or "").startswith("wait:"):
+        if mode == "notify":            # 「只显示」不发通知；「自动换号」自己会换号，也不发建议
+            notify_policy(cfg, st, rec, inter)
+        if rec.get("action") != "switch" and not str(st.get("last_notified") or "").startswith("wait:"):
             st["last_notified"] = None
         _save_tick_state(cfg, st, notified0)
         if pinged:
@@ -1856,18 +2148,18 @@ def cmd_resume(args, cfg):
 
 
 def pick_target(cfg: dict, st: dict, exclude=None):
-    """还有余量（<90%）的号里，选最早刷新的那个（EDF）。"""
+    """还有余量（<90%）、本周额度没用完的号里，选最早刷新的那个（EDF）；周额度紧张的号排后面。"""
     c = []
     for a in cfg["accounts"]:
         n = a["name"]
         if n == exclude or not has_profile(n):
             continue
         u = st["accounts"].get(n, {})
-        eu = effective_util(u)
-        if eu is None or eu >= 90:
+        eu, dr = decision_util(u), decision_resets(u)
+        if eu is None or eu >= 90 or weekly_out(u):
             continue
-        c.append((0 if window_running(u) else 1, u.get("resets_at") if window_running(u) else 9e12, n))
-    return min(c)[2] if c else None
+        c.append((1 if weekly_tight(u) else 0, 0 if dr else 1, dr or 9e12, n))
+    return min(c)[-1] if c else None
 
 
 # ───────────────────────── 切换 ─────────────────────────
@@ -2004,17 +2296,30 @@ def cmd_status(args, cfg):
                             "pin_org_ready": all(a.get("org_uuid") in (read_json(ORG_COOKIES, {}) or {})
                                                  for a in cfg["accounts"] if a.get("org_uuid")),
                             "org_names": sorted({a.get("org_name") for a in cfg["accounts"] if a.get("org_name")}),
-                            "active_hours": cfg.get("active_hours")},
-               "in_active_hours": in_active_hours(cfg)}
+                            "active_hours": cfg.get("active_hours"),
+                            "notify_expiring": cfg.get("notify_expiring", False)},
+               "in_active_hours": in_active_hours(cfg),
+               "net_down_since": st.get("net_down_since")}
         if out["recommend"] and out["recommend"].get("target"):
             out["recommend"]["target_label"] = lbl(cfg, out["recommend"]["target"])
         for a in cfg["accounts"]:
             u = st["accounts"].get(a["name"], {})
+            v = as_shown(u)                       # 偶发的一次读不到：照常显示上次的数
+            ok = bool(v.get("ok"))
+            stale = not ok and (v.get("stale_resets_at") or 0) > now()
+            fail = None
+            if u.get("last_ping_ok") is False and now() - (u.get("last_ping") or 0) < 3 * 3600:
+                fail = {"at": u.get("last_ping"), "kind": u.get("last_ping_kind") or "other", "retry_at": ping_retry_at(u)}
             out["accounts"].append({"name": a["name"], "label": a.get("label") or a["name"],
                                     "email": a.get("email"),
-                                    "util": effective_util(u), "running": bool(shown_resets(u)),
-                                    "resets_at": shown_resets(u),
-                                    "error": u.get("error"), "has_profile": has_profile(a["name"]),
+                                    "util": effective_util(v), "running": bool(shown_resets(v)),
+                                    "resets_at": shown_resets(v),
+                                    "error": v.get("error"), "error_kind": None if ok else (v.get("error_kind") or "other"),
+                                    "stale_util": v.get("stale_util") if stale else None,
+                                    "ok_at": u.get("ok_at"),
+                                    "weekly_util": u.get("weekly_util"), "weekly_resets_at": u.get("weekly_resets_at"),
+                                    "eta": eta_of(v), "prewarm": a.get("prewarm", True), "ping_fail": fail,
+                                    "has_profile": has_profile(a["name"]),
                                     "desktop_current": st.get("desktop_current") == a["name"],
                                     "last_ping": u.get("last_ping")})
         print(json.dumps(out, ensure_ascii=False))
@@ -2024,11 +2329,13 @@ def cmd_status(args, cfg):
         return
     print(f"{C['b']}Cduo{C['r']}  {dt.datetime.now():%H:%M}   切换方式：{MODE_TEXT.get(cfg.get('auto_switch'), '?')}")
     for a in cfg["accounts"]:
-        u = st["accounts"].get(a["name"], {})
+        u = as_shown(st["accounts"].get(a["name"], {}))
         mark = f"{C['c']}●{C['r']}" if st.get("desktop_current") == a["name"] else " "
         eu = effective_util(u)
         if eu is None:
             bar = f"{C['y']}?  {u.get('error') or '无数据'}{C['r']}"
+            if (u.get("stale_resets_at") or 0) > now() and u.get("stale_util") is not None:
+                bar += f"{C['d']}（{dur(now() - (u.get('ok_at') or now()))}前读到：已用 {u['stale_util']:.0f}%）{C['r']}"
         else:
             col = C["g"] if eu < 70 else (C["y"] if eu < 95 else C["red"])
             filled = int(round(eu / 10))
@@ -2036,7 +2343,14 @@ def cmd_status(args, cfg):
             when = (f"{hhmm(sr)} 刷新额度（还有 {dur(sr - now())}）" + ("" if window_running(u) else "（刚开始计时，估算）")
                     if sr else "满额，还没开始计时")
             bar = f"{col}{'█' * filled}{'░' * (10 - filled)} 已用 {eu:3.0f}%{C['r']}  {when}"
+            eta = eta_of(u)
+            if eta:
+                bar += f"  {C['y']}按现在的速度约 {hhmm(eta)} 用完{C['r']}"
+            if u.get("weekly_util"):
+                bar += f"  {C['d']}本周已用 {u['weekly_util']:.0f}%{C['r']}"
         prof = "" if has_profile(a["name"]) else f"  {C['y']}(还没在桌面版登录：cduo login-desktop {a['name']}){C['r']}"
+        if not a.get("prewarm", True):
+            prof += f"  {C['d']}(不参与预热){C['r']}"
         print(f" {mark} {(a.get('label') or a['name']):<8} {bar}{prof}")
     rec = st.get("recommend") or {}
     np_ = st.get("next_ping") or {}
@@ -2350,7 +2664,12 @@ def cmd_ping(args, cfg):
     ok = do_ping(cfg, a, "手动")
     u = fetch_account_usage(cfg, a)
     u["last_ping"], u["last_ping_ok"] = now(), ok
-    update_state(lambda st: st["accounts"].__setitem__(a["name"], u))
+    u["last_ping_kind"] = None if ok else _PING_ERR.get(a["name"], "other")
+
+    def put(st):
+        prev = st["accounts"].get(a["name"], {})
+        st["accounts"][a["name"]] = carry_stale(prev, with_history(prev, u))
+    update_state(put)
     print(("✓ 已预热 " if ok else "✗ 预热失败 ") + a["name"] +
           (f"，窗口 {hhmm(u['resets_at'])} 重置" if window_running(u) else ""))
 
@@ -2390,7 +2709,7 @@ def cmd_config(args, cfg):
         if val not in ("off", "notify", "idle"):
             die("auto_switch 只能是 off / notify / idle")
         cfg[key] = val
-    elif key in ("prewarm_enabled", "confirm_switch", "pin_org", "auto_resume"):
+    elif key in ("prewarm_enabled", "confirm_switch", "pin_org", "auto_resume", "notify_expiring"):
         cfg[key] = onoff(val)
     elif key in ("proxy", "claude_bin"):
         cfg[key] = val
@@ -2431,12 +2750,40 @@ def cmd_pin_org(args, cfg):
     print(f"✓ 已固定：以后换号都会进入「{a.get('org_name')}」")
 
 
+def cmd_prewarm(args, cfg):
+    """某个号参不参与自动预热（提前开始计时）。不参与的号照样显示额度、照样能换过去。
+
+    比如这个号也在别处用（别的电脑、手机），它的计时总被打乱，就让它只参与换号。
+    """
+    a = get_account(cfg, args.name)
+    a["prewarm"] = args.state == "on"
+    save_config(cfg)
+    print(f"{C['g']}✓ {lbl(cfg, a['name'])} " + ("参与预热" if a["prewarm"] else "不再参与预热（照样显示额度、能换过去）")
+          + f"{C['r']}")
+
+
+def _delete_cli_login(cli_dir: str) -> bool:
+    """删掉 cduo 自己建的 CLI 目录里的登录：钥匙串条目和整个目录。不是 cduo 建的目录一律不动。"""
+    try:
+        inside = pathlib.Path(cli_dir).resolve().is_relative_to(CLIROOT.resolve())
+    except OSError:                                   # 路径读不了就不动
+        inside = False
+    if not inside:
+        return False
+    subprocess.run(["security", "delete-generic-password", "-a", os.environ.get("USER", ""),
+                    "-s", kc_service(cli_dir)], capture_output=True)
+    shutil.rmtree(cli_dir, ignore_errors=True)
+    return True
+
+
 def cmd_remove(args, cfg):
     """不再让 cduo 管理某个号。
 
-    它的桌面版登录快照挪进备份目录；CLI 登录目录原样保留，以后用 cduo add 加回来不用重新授权。
+    默认：它的桌面版登录快照挪进备份目录；CLI 登录原样保留，以后用 cduo add 加回来不用重新授权。
+    --purge：把它在本机的登录全清掉（CLI 凭据和钥匙串、登录快照、含它登录的旧备份）。借来的号用完用这个。
     """
     a = get_account(cfg, args.name)
+    purge = bool(getattr(args, "purge", False))
     if current_desktop_profile(cfg, load_state()) == a["name"] and not args.force:
         die(f"Claude 桌面版现在登录的就是 {args.name}。先切到别的号再移除（确定要移除就加 --force）")
     cfg["accounts"] = [x for x in cfg["accounts"] if x["name"] != a["name"]]
@@ -2449,8 +2796,42 @@ def cmd_remove(args, cfg):
         if (st.get("recommend") or {}).get("target") == a["name"]:
             st.pop("recommend", None)
     update_state(drop)
-    moved = None
     d = profile_dir(a["name"])
+    if purge:
+        done = []
+        if d.exists():
+            shutil.rmtree(d, ignore_errors=True)
+            done.append("桌面版登录快照")
+        olds = list(BACKUP.glob(f"*-removed-{a['name']}")) if BACKUP.is_dir() else []
+        for p in olds:                                 # 以前「移除」时挪进备份的快照
+            shutil.rmtree(p, ignore_errors=True)
+        uid = a.get("account_uuid")
+        shared = bool(uid) and any(x.get("account_uuid") == uid for x in cfg["accounts"])
+        n = 0
+        if uid and not shared:                         # 换号前的整份备份里，登录着这个号的那些
+            for p in list_desktop_backups():
+                try:
+                    bu = (read_json(p / "config.json", {}) or {}).get("lastKnownAccountUuid")
+                except RuntimeError:
+                    bu = None
+                if bu == uid:
+                    shutil.rmtree(p, ignore_errors=True)
+                    n += 1
+        if n + len(olds):
+            done.append(f"{n + len(olds)} 份含它登录的备份")
+        cli_gone = a.get("owned") and _delete_cli_login(a["cli_dir"])
+        if cli_gone:
+            done.append("CLI 登录（钥匙串和目录）")
+        log(f"removed and purged account {a['name']}: {', '.join(done) or 'nothing on disk'}")
+        print(f"{C['g']}✓ 已移除 {args.name}，并清除了：{'、'.join(done) or '（本机没有它的登录数据）'}{C['r']}")
+        if not cli_gone:
+            print(f"  它用的 CLI 目录不是 cduo 建的（{a['cli_dir']}），没有动。")
+        if shared:
+            print("  还有别的号用同一个账号登录，含这个账号登录的备份保留了。")
+        if len(cfg["accounts"]) < 2:
+            print(f"{C['y']}! 现在只剩 {len(cfg['accounts'])} 个号了，换号、错峰都需要至少两个：cduo setup --add{C['r']}")
+        return
+    moved = None
     if d.exists():
         moved = BACKUP / f"{dt.datetime.now():%Y%m%d-%H%M%S}-removed-{a['name']}"
         moved.parent.mkdir(parents=True, exist_ok=True)
@@ -2876,9 +3257,13 @@ def main():
     p = sub.add_parser("rename", help="改账号的显示名（菜单栏/通知里显示）")
     p.add_argument("name")
     p.add_argument("label")
-    p = sub.add_parser("remove", help="不再管理某个号（桌面版登录快照挪进备份，CLI 登录保留）")
+    p = sub.add_parser("remove", help="不再管理某个号（默认保留它的登录，以后加回来不用重新授权）")
     p.add_argument("name")
+    p.add_argument("--purge", action="store_true", help="同时清除它在本机的登录：CLI 凭据和钥匙串、登录快照、含它登录的备份")
     p.add_argument("--force", action="store_true", help="桌面版当前登录的就是它也照样移除")
+    p = sub.add_parser("prewarm", help="某个号参不参与自动预热：cduo prewarm 名字 on|off")
+    p.add_argument("name")
+    p.add_argument("state", choices=["on", "off"])
     p = sub.add_parser("agents", help="后台调度和菜单栏：install / uninstall / status / login-on / login-off")
     p.add_argument("action", choices=["install", "uninstall", "status", "login-on", "login-off"])
     p.add_argument("--no-menubar", action="store_true")
@@ -2900,7 +3285,7 @@ def main():
             "capture": cmd_capture, "desktop-login": cmd_desktop_login, "ping": cmd_ping, "sync": cmd_sync,
             "tick": cmd_tick, "config": cmd_config, "agents": cmd_agents, "doctor": cmd_doctor,
             "rename": cmd_rename, "pin-org": cmd_pin_org, "resume": cmd_resume, "login-desktop": cmd_login_desktop,
-            "restore": cmd_restore, "remove": cmd_remove}
+            "restore": cmd_restore, "remove": cmd_remove, "prewarm": cmd_prewarm}
     if not args.cmd:
         args = ap.parse_args(["status"])
     try:
